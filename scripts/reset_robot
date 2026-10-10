@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""
+reset_robot - remove the survey aircraft from a running Gazebo world.
+
+Only needed when running the staged launches. Killing survey_robot.launch stops
+its nodes but leaves the spawned model behind in gzserver, because the model
+belongs to Gazebo rather than to the launch that asked for it. Relaunching then
+hits
+
+    Spawn status: SpawnModel: Failure - entity already exists.
+    Spawn service failed. Exiting.
+
+which is not fatal - the old model is still there with its controllers loaded,
+so the survey does run - but the aircraft starts from wherever it was left
+rather than from the spawn point, and a real spawn error scrolls past looking
+like the reason if anything else goes wrong.
+
+    rosrun uav_farm_survey reset_robot
+    rosrun uav_farm_survey reset_robot uav_1
+
+Then relaunch survey_robot.launch and the spawn is clean.
+"""
+import sys
+
+import rospy
+from gazebo_msgs.srv import DeleteModel
+
+
+def main():
+    name = sys.argv[1] if len(sys.argv) > 1 else 'uav_0'
+    rospy.init_node('reset_robot', anonymous=True)
+
+    try:
+        rospy.wait_for_service('/gazebo/delete_model', timeout=10.0)
+    except rospy.ROSException:
+        print('no Gazebo on this master - is orchard_world.launch running?')
+        return 1
+
+    try:
+        resp = rospy.ServiceProxy('/gazebo/delete_model', DeleteModel)(name)
+    except rospy.ServiceException as exc:
+        print('delete failed: %s' % exc)
+        return 1
+
+    # Deleting a model that was never there is a success as far as this script
+    # is concerned - the postcondition asked for is "no model called this", and
+    # that already holds.
+    print('%s: %s' % (name, resp.status_message))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

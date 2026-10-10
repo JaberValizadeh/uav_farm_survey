@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""
+survey_pilot - flies one quadrotor over a field, line by line, and stops.
+
+This is a coverage controller rather than a goal-seeking one, and that is a
+different problem from everything else in this workspace. The bushfire drones
+chase things: something appears, they decide whether it is worth going to, they
+go. This aircraft is not looking for anywhere in particular - it is trying to
+make sure that every square metre of the field has passed under its camera at
+least once, and then to know that it has finished.
+
+The pattern
+-----------
+Boustrophedon - "as the ox ploughs" - which is the lawnmower pattern and the
+standard answer for covering a rectangle. Fly the length of the field, step
+across by one swath, fly back the other way, repeat.
+
+    leg 0   >>>>>>>>>>>>>>>>>>>>>>>>>>>>  y = -4.8
+    leg 1   <<<<<<<<<<<<<<<<<<<<<<<<<<<<  y = -2.4
+    leg 2   >>>>>>>>>>>>>>>>>>>>>>>>>>>>  y =  0.0
+    leg 3   <<<<<<<<<<<<<<<<<<<<<<<<<<<<  y =  2.4
+    leg 4   >>>>>>>>>>>>>>>>>>>>>>>>>>>>  y =  4.8
+
+The legs alternate direction because the alternative - flying back to the start
+of every line - spends half the flight not surveying. On a battery that is the
+whole argument.
+
+Leg spacing, and why it is not the camera footprint
+---------------------------------------------------
+Coverage theory says the legs should be one camera swath apart, less an overlap
+for safety. At 4 m with an 80-degree lens the footprint is 2 * 4 * tan(40) =
+6.7 m across, so 30% overlap would put the legs 4.7 m apart and cover this
+field in three passes rather than five.
+
+~leg_spacing defaults to 2.4 m instead, which is the *row* spacing, so each leg
+flies directly along one row of bushes. That is a deliberate trade and worth
+being explicit about: it is two passes more flying than coverage requires, and
+in exchange every fruit is seen from directly overhead rather than obliquely
+from the edge of a wide frame. Fruit at the edge of the footprint is seen
+through more foliage, at a worse angle, with more of the projection error that
+comes from the flat-plane assumption. On a farm laid out in rows, flying the
+rows is what the sensor wants.
+
+Set ~leg_spacing to 4.7 to fly the coverage-optimal pattern instead. The field
+still gets covered; the detections just get worse at the edges.
+
+Speed
+-----
+~survey_speed is slower than the aircraft can fly, and the limit is the camera
+rather than the airframe. At 10 Hz and 1.2 m/s the drone advances 0.12 m
+between frames, so a 0.18 m berry appears in several consecutive images and a
+single missed frame costs nothing. Fly at 4 m/s and the same berry gets one
+frame, maybe none.
+
+Finishing
+---------
+The survey ends. That is the other thing that makes this different from the
+fire packages, where the work is endless by construction: here there is a
+defined area, the pattern covers it, and when the last leg is flown the
+aircraft returns to its launch point and lands. DONE is a real state and
+/farm/progress reports it, so a harvest planner downstream knows the map it is
+reading is complete rather than partial.
+
+Subscriptions
+-------------
+  ground_truth/state    nav_msgs/Odometry           pose and velocity
+
+Publications
+------------
+  cmd_vel               geometry_msgs/Twist         body-frame velocity
+  /farm/progress        uav_farm_survey/SurveyProgress
+  /farm/survey_path     nav_msgs/Path               the planned pattern, latched
+
+Services used
+-------------
+  engage                std_srvs/Empty              spin the motors up
+
+ROS Parameters (private, ~)
+---------------------------
+  ~field_x_min/max  float  The field to cover, m        (default -10.5 / 10.5)
+  ~field_y_min/max  float                               (default  -4.8 /  4.8)
+  ~leg_spacing      float  Distance between lines, m    (default 2.4)
+  ~survey_altitude  float  Height to fly the survey, m  (default 4.0)
+  ~survey_speed     float  Along-leg speed, m/s         (default 1.2)
+  ~turn_speed       float  Speed while stepping across  (default 0.8)
+  ~arrive_radius    float  Waypoint reached inside this (default 0.35)
+  ~angular_gain     float  Heading P-gain               (default 2.0)
+  ~max_angular      float  Yaw rate cap, rad/s          (default 1.2)
+  ~angle_tol        float  Heading tolerance, rad       (default 0.10)
+  ~climb_tol        float  Altitude reached within, m   (default 0.20)
+  ~vertical_speed   float  Max climb rate, m/s          (default 0.8)
+  ~hfov_deg         float  Camera FOV, for the covered
+                           area figure only             (default 80.0)
+  ~return_home      bool   Land at the launch point
+                           when finished                (default true)
+  ~control_hz       float  Control loop rate, Hz        (default 20.0)
+  ~status_hz        float  Status print rate, Hz        (default 1.0)
+"""
+
+import math
+
+import rospy
+from geometry_msgs.msg import Twist, PoseStamped
+from nav_msgs.msg import Odometry, Path
+from std_srvs.srv import Empty
+from tf.transformations import euler_from_quaternion, quaternion_from_euler
+
+from uav_farm_survey.msg import SurveyProgress
+
+_RESET, _BOLD = '\033[0m', '\033[1m'
+_GREEN, _CYAN, _YELLOW, _WHITE = '\033[92m', '\033[96m', '\033[93m', '\033[97m'
+
+
+def _norm(a):
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a < -math.pi:
+        a += 2.0 * math.pi
+    return a
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+class SurveyPilot(object):
+
+    def __init__(self):
+        rospy.init_node('survey_pilot', anonymous=False)
+        self._ns = rospy.get_namespace().strip('/') or 'uav'
+
+        self._x0 = rospy.get_param('~field_x_min', -10.5)
+        self._x1 = rospy.get_param('~field_x_max', 10.5)
+        self._y0 = rospy.get_param('~field_y_min', -4.8)
+        self._y1 = rospy.get_param('~field_y_max', 4.8)
+        self._spacing = rospy.get_param('~leg_spacing', 2.4)
+        self._alt = rospy.get_param('~survey_altitude', 4.0)
+        self._speed = rospy.get_param('~survey_speed', 1.2)
+        self._turn_speed = rospy.get_param('~turn_speed', 0.8)
+        self._arrive = rospy.get_param('~arrive_radius', 0.35)
+        self._ang_gain = rospy.get_param('~angular_gain', 2.0)
+        self._max_ang = rospy.get_param('~max_angular', 1.2)
+        self._angle_tol = rospy.get_param('~angle_tol', 0.10)
+        self._climb_tol = rospy.get_param('~climb_tol', 0.20)
+        self._vert = rospy.get_param('~vertical_speed', 0.8)
+        self._hfov = math.radians(rospy.get_param('~hfov_deg', 80.0))
+        self._return_home = rospy.get_param('~return_home', True)
+        control_hz = rospy.get_param('~control_hz', 20.0)
+        status_hz = rospy.get_param('~status_hz', 1.0)
+
+        self._x = self._y = self._z = 0.0
+        self._yaw = 0.0
+        self._ready = False
+        self._home = None
+
+        self._state = 'TAKEOFF'
+        self._wp = 0
+        self._covered = 0.0
+        self._last_pos = None
+
+        self._plan = self._plan_survey()
+        self._swath = 2.0 * self._alt * math.tan(self._hfov / 2.0)
+        self._area_total = (self._x1 - self._x0) * (self._y1 - self._y0)
+
+        rospy.Subscriber('ground_truth/state', Odometry, self._odom_cb)
+        self._cmd = rospy.Publisher('cmd_vel', Twist, queue_size=1)
+        self._prog = rospy.Publisher('/farm/progress', SurveyProgress,
+                                     queue_size=5)
+        self._path_pub = rospy.Publisher('/farm/survey_path', Path,
+                                         queue_size=1, latch=True)
+
+        self._engage_srv = None
+        try:
+            rospy.wait_for_service('engage', timeout=60.0)
+            self._engage_srv = rospy.ServiceProxy('engage', Empty)
+            self._engage_srv()
+            rospy.loginfo('[%s] motors engaged', self._ns)
+        except Exception as exc:
+            rospy.logerr('[%s] could not engage motors: %s', self._ns, exc)
+
+        self._publish_path()
+        self._print_header()
+
+        rospy.Timer(rospy.Duration(1.0 / control_hz), self._loop)
+        rospy.Timer(rospy.Duration(1.0 / status_hz), self._status)
+
+    # ------------------------------------------------------------ planning --
+    def _plan_survey(self):
+        """The boustrophedon, as a list of waypoints.
+
+        Built once, at startup, rather than decided in flight. A coverage
+        pattern over a known rectangle has no reason to be reactive, and having
+        the whole plan as data means it can be published for RViz and counted
+        against - "leg 3 of 5" is only meaningful because the 5 was known
+        before the aircraft left the ground.
+        """
+        legs = []
+        n = max(1, int(round((self._y1 - self._y0) / self._spacing)) + 1)
+        for i in range(n):
+            y = self._y0 + i * (self._y1 - self._y0) / max(n - 1, 1)
+            if i % 2 == 0:
+                legs.append(((self._x0, y), (self._x1, y)))
+            else:
+                legs.append(((self._x1, y), (self._x0, y)))
+        wps = []
+        for a, b in legs:
+            wps.append(a)
+            wps.append(b)
+        return wps
+
+    def _publish_path(self):
+        path = Path()
+        path.header.frame_id = 'world'
+        path.header.stamp = rospy.Time.now()
+        for x, y in self._plan:
+            p = PoseStamped()
+            p.header.frame_id = 'world'
+            p.pose.position.x, p.pose.position.y = x, y
+            p.pose.position.z = self._alt
+            p.pose.orientation.w = 1.0
+            path.poses.append(p)
+        self._path_pub.publish(path)
+
+    # ------------------------------------------------------------- display --
+    def _print_header(self):
+        legs = len(self._plan) // 2
+        print()
+        print(_BOLD + _WHITE + '+--------------------------------------------------+' + _RESET)
+        print(_BOLD + _WHITE + '|   FARM SURVEY  -  %-30s|' % self._ns + _RESET)
+        print(_BOLD + _WHITE + '+--------------------------------------------------+' + _RESET)
+        print('  field    : x %.1f..%.1f   y %.1f..%.1f   (%.0f m2)'
+              % (self._x0, self._x1, self._y0, self._y1, self._area_total),
+              flush=True)
+        print('  pattern  : %d legs, %.2f m apart, at %.1f m'
+              % (legs, self._spacing, self._alt), flush=True)
+        print('  camera   : %.1f m swath, so legs overlap by %.0f%%'
+              % (self._swath, 100.0 * max(0.0, 1.0 - self._spacing / self._swath)),
+              flush=True)
+        print(flush=True)
+
+    def _status(self, _e):
+        if not self._ready:
+            return
+        leg = min(self._wp // 2, len(self._plan) // 2 - 1)
+        col = {'SURVEY': _GREEN, 'TURN': _YELLOW, 'DONE': _CYAN}.get(
+            self._state, _WHITE)
+        print('  [%s] [%s%-7s%s] pos=(%6.2f,%6.2f,%5.2f) leg %d/%d '
+              'covered %5.1f%%'
+              % (self._ns, col, self._state, _RESET, self._x, self._y, self._z,
+                 leg + 1, len(self._plan) // 2,
+                 100.0 * min(1.0, self._covered / max(self._area_total, 1e-6))),
+              flush=True)
+
+    def _publish_progress(self):
+        m = SurveyProgress()
+        m.header.stamp = rospy.Time.now()
+        m.header.frame_id = 'world'
+        m.state = self._state
+        m.leg = min(self._wp // 2, max(len(self._plan) // 2 - 1, 0))
+        m.legs_total = len(self._plan) // 2
+        if self._wp < len(self._plan):
+            a = self._plan[self._wp - 1] if self._wp else self._plan[0]
+            b = self._plan[self._wp]
+            span = math.hypot(b[0] - a[0], b[1] - a[1])
+            done = math.hypot(self._x - a[0], self._y - a[1])
+            m.leg_progress = _clamp(done / max(span, 1e-6), 0.0, 1.0)
+        else:
+            m.leg_progress = 1.0
+        m.area_covered = self._covered
+        m.area_total = self._area_total
+        self._prog.publish(m)
+
+    # ----------------------------------------------------------- callbacks --
+    def _odom_cb(self, msg):
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        self._x, self._y, self._z = p.x, p.y, p.z
+        _, _, self._yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        if not self._ready:
+            self._home = (p.x, p.y)
+        self._ready = True
+
+    def _accrue_coverage(self):
+        """Swept area, as swath width times distance flown on a survey leg.
+
+        Only counted while actually surveying, and only along the leg - the
+        step across between lines re-covers ground the last leg already had, so
+        counting it would report more than 100% of a field that had been swept
+        once. It is an estimate either way: it does not subtract the overlap
+        between neighbouring legs, so it is generous by design and is a
+        progress bar rather than a measurement.
+        """
+        if self._last_pos is None:
+            self._last_pos = (self._x, self._y)
+            return
+        if self._state == 'SURVEY':
+            d = math.hypot(self._x - self._last_pos[0], self._y - self._last_pos[1])
+            self._covered += d * self._spacing
+        self._last_pos = (self._x, self._y)
+
+    # --------------------------------------------------------- the control --
+    def _goto(self, cmd, tx, ty, speed):
+        """Fly at a world point, body-frame.
+
+        /cmd_vel is hector's yaw-stabilized body frame - linear.x means
+        forward, whatever the aircraft is pointed at - so this yaws onto the
+        bearing and then flies straight, exactly as the bushfire controllers
+        do. Building a world-frame command here instead would be rotated by yaw
+        a second time and fly the drone along twice its heading.
+        """
+        dx, dy = tx - self._x, ty - self._y
+        dist = math.hypot(dx, dy)
+        err = _norm(math.atan2(dy, dx) - self._yaw)
+        cmd.angular.z = _clamp(self._ang_gain * err, -self._max_ang, self._max_ang)
+        if abs(err) > 2.0 * self._angle_tol:
+            return dist          # turn first; a survey leg flown crabbing is a
+                                 # leg whose camera footprint is not where the
+                                 # plan says it is
+        slow = min(1.0, max(0.25, dist / 1.5))
+        cmd.linear.x = speed * slow
+        return dist
+
+    def _loop(self, _e):
+        if not self._ready:
+            return
+        cmd = Twist()
+        self._accrue_coverage()
+
+        if self._state == 'TAKEOFF':
+            err = self._alt - self._z
+            cmd.linear.z = _clamp(1.0 * err, -self._vert, self._vert)
+            if abs(err) < self._climb_tol:
+                self._state = 'SURVEY'
+                rospy.loginfo('[%s] at %.2f m - starting leg 1 of %d',
+                              self._ns, self._z, len(self._plan) // 2)
+            self._cmd.publish(cmd)
+            self._publish_progress()
+            return
+
+        # Altitude is held in every state: the projection from pixels to ground
+        # assumes a known camera height, so drifting off the survey altitude
+        # quietly biases every fruit position the detector reports.
+        cmd.linear.z = _clamp(1.0 * (self._alt - self._z), -self._vert, self._vert)
+
+        if self._state == 'DONE':
+            if self._return_home and self._home is not None:
+                if math.hypot(self._x - self._home[0],
+                              self._y - self._home[1]) > self._arrive:
+                    self._goto(cmd, self._home[0], self._home[1], self._turn_speed)
+                else:
+                    cmd.linear.z = -self._vert * 0.5 if self._z > 0.4 else 0.0
+            self._cmd.publish(cmd)
+            self._publish_progress()
+            return
+
+        tx, ty = self._plan[self._wp]
+        # Even waypoints start a leg (the aircraft is stepping across to it),
+        # odd ones end it (the aircraft is surveying along it).
+        self._state = 'SURVEY' if self._wp % 2 else 'TURN'
+        speed = self._speed if self._state == 'SURVEY' else self._turn_speed
+
+        if self._goto(cmd, tx, ty, speed) <= self._arrive:
+            self._wp += 1
+            if self._wp >= len(self._plan):
+                self._state = 'DONE'
+                rospy.loginfo('[%s] survey complete - %d legs, %.0f m2 swept',
+                              self._ns, len(self._plan) // 2, self._covered)
+                print(_BOLD + _GREEN +
+                      '  *** SURVEY COMPLETE - %d legs flown ***'
+                      % (len(self._plan) // 2) + _RESET, flush=True)
+            elif self._wp % 2 == 0:
+                rospy.loginfo('[%s] leg %d of %d done', self._ns,
+                              self._wp // 2, len(self._plan) // 2)
+
+        self._cmd.publish(cmd)
+        self._publish_progress()
+
+
+def main():
+    SurveyPilot()
+    rospy.spin()
+
+
+if __name__ == '__main__':
+    main()

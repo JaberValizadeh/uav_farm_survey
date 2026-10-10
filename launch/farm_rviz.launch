@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<!--
+  farm_rviz.launch
+  ================
+  Step 3 of 4: the survey as a map rather than as a picture.
+
+    roslaunch uav_farm_survey farm_rviz.launch
+
+  Shows the planned coverage pattern (/farm/survey_path, latched, so it is
+  there however late RViz is started) and the fruit map building up as the
+  drone flies (/farm/markers, coloured by position spread - a tight cluster
+  seen many times is a confident detection, a wide one means the projection is
+  disagreeing with itself).
+
+  Safe to start, kill and restart at any point in a run. Nothing here publishes;
+  it only listens.
+-->
+<launch>
+
+  <arg name="rviz_config" default="$(find uav_farm_survey)/rviz/farm.rviz" />
+  <arg name="delay" default="0" doc="the all-in-one launch waits for the world; started by hand, do not" />
+
+  <node name="rviz" pkg="rviz" type="rviz"
+        args="-d $(arg rviz_config)" output="screen" required="false"
+        launch-prefix="bash -c 'sleep $(arg delay) &amp;&amp; exec &quot;$0&quot; &quot;$@&quot;' --" />
+
+</launch>

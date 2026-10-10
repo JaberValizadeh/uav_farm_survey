@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""
+make_orchard_textures - the tiling textures the orchard is built from.
+
+Everything in this world used to be a flat <diffuse> colour: plastic-green
+foliage spheres, a plastic-brown trunk, and a single unbroken green box for the
+grass. That reads as a diagram of an orchard. Texture is most of the difference
+between a generated world and a photograph of one, and it costs nothing at run
+time - a tiled 256 px image is cheaper than the extra geometry you would
+otherwise need to break up a flat surface.
+
+The colour constraint that governs all of this
+----------------------------------------------
+fruit_detector calls a pixel ripe fruit when its hue is red (below 10 or above
+170 on OpenCV's scale) AND its saturation is at least 160. Bark and soil are
+brown, and brown IS dark orange - it lands in the low red band. The world
+therefore cannot rely on hue to stay out of the detector's way, and this is not
+hypothetical: an earlier orchard had bark and soil at hue 14 and 15, four units
+off the threshold, and every shadow that nudged a pixel across the line became
+a false apple - 31 of them.
+
+Saturation is the guard that does not depend on a four-unit margin holding. So
+every texture here is checked against the detector's own thresholds as it is
+written, and the script fails rather than emit one that could be mistaken for
+fruit. A texture has a *spread*, not a colour, so what matters is its worst
+pixel and not its average - a mean well under the floor tells you nothing about
+the tail.
+
+  rosrun uav_farm_survey make_orchard_textures
+"""
+
+import argparse
+import os
+import sys
+
+import numpy as np
+from PIL import Image
+from scipy import ndimage
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PKG = os.path.dirname(HERE)
+OUT = os.path.join(PKG, 'models', 'orchard', 'materials', 'textures')
+SEED = 41
+
+# fruit_detector's ripeness test, mirrored here so the check below is against
+# the real thresholds rather than a copy of them that can go stale.
+HUE_LO_MAX, HUE_HI_MIN, SAT_MIN, VAL_MIN = 10, 170, 160, 60
+# How much room to insist on. A texture that just scrapes under the floor is
+# one lighting change away from being fruit.
+SAT_HEADROOM = 30
+
+
+# ------------------------------------------------------------------ helpers --
+
+def noise(size, scale, rng):
+    """Noise that wraps, so a tiled surface has no seams."""
+    f = ndimage.gaussian_filter(rng.random((size, size)), scale, mode='wrap')
+    span = float(f.max() - f.min())
+    return (f - f.min()) / (span if span > 1e-9 else 1.0)
+
+
+def mix(a, b, w):
+    return np.array(a) * (1 - w[..., None]) + np.array(b) * w[..., None]
+
+
+def hsv_of(img):
+    """OpenCV-scale H (0-179), S and V (0-255), without needing OpenCV."""
+    x = img.astype(np.float64)
+    v = x.max(axis=2)
+    c = v - x.min(axis=2)
+    s = np.where(v > 0, 255.0 * c / np.where(v > 0, v, 1), 0.0)
+    r, g, b = x[..., 0], x[..., 1], x[..., 2]
+    safe = np.where(c > 0, c, 1.0)
+    h = np.zeros_like(v)
+    rm, gm, bm = (v == r) & (c > 0), (v == g) & (c > 0), (v == b) & (c > 0)
+    gm &= ~rm
+    bm &= ~rm & ~gm
+    h[rm] = (((g - b) / safe)[rm] % 6.0)
+    h[gm] = ((b - r) / safe)[gm] + 2.0
+    h[bm] = ((r - g) / safe)[bm] + 4.0
+    return h * 30.0, s, v          # *30 = OpenCV's half-degree hue
+
+
+def fruit_like(img):
+    """Fraction of pixels fruit_detector would accept as ripe apple."""
+    h, s, v = hsv_of(img)
+    red = (h <= HUE_LO_MAX) | (h >= HUE_HI_MIN)
+    return float((red & (s >= SAT_MIN) & (v >= VAL_MIN)).mean())
+
+
+def worst_red_saturation(img):
+    """Highest saturation among the red-hued pixels - the number that matters.
+
+    A brown texture is *entirely* red-hued as far as this test is concerned, so
+    this is effectively its peak saturation. It has to clear the detector's
+    floor with room, at the texture's worst pixel and not its average.
+    """
+    h, s, _ = hsv_of(img)
+    red = (h <= HUE_LO_MAX) | (h >= HUE_HI_MIN)
+    return float(s[red].max()) if red.any() else 0.0
+
+
+# ----------------------------------------------------------------- surfaces --
+
+def grass_sward(size, rng):
+    """The mown alley between rows: orchards are grassed, not bare."""
+    blades = noise(size, 0.9, rng)
+    patchy = noise(size, size / 8.0, rng)
+    img = mix((62, 84, 38), (108, 132, 62), 0.25 + 0.6 * patchy)
+    img = img * (0.84 + 0.32 * blades)[..., None]
+    # Mower stripes, the giveaway that grass is managed rather than wild.
+    stripe = 0.5 + 0.5 * np.sin(np.linspace(0, 2 * np.pi * 2, size))[:, None]
+    img = img * (0.94 + 0.10 * stripe)
+    dry = np.clip((noise(size, size / 12.0, rng) - 0.66) * 3.2, 0, 1)
+    return np.clip(mix(img, (138, 132, 84), dry * 0.45), 0, 255)
+
+
+def herbicide_strip(size, rng):
+    """The bare, weed-free band kept under the tree row.
+
+    Deliberately grey-brown rather than the rich red-brown soil wants to be.
+    See the note at the top: this surface is red-hued by definition and only
+    its saturation keeps it out of the fruit map.
+    """
+    broad = noise(size, size / 10.0, rng)
+    grain = noise(size, 1.1, rng)
+    img = mix((104, 92, 78), (140, 126, 110), 0.3 + 0.55 * broad)
+    img = img * (0.9 + 0.2 * grain)[..., None]
+    # Bark-mulch chips and small stones, lit from one side so they read as
+    # lumps rather than as spots.
+    lumps = noise(size, 2.2, rng)
+    edge = np.clip((lumps - 0.63) * 8.0, 0, 1)
+    lit = np.roll(edge, (-2, -2), (0, 1)) - np.roll(edge, (2, 2), (0, 1))
+    return np.clip(img * (1.0 + 0.24 * lit)[..., None], 0, 255)
+
+
+def bark(size, rng):
+    """Apple bark: grey-brown, fissured vertically, lichen-flecked."""
+    fissure = noise(size, 1.4, rng)
+    ridge = 0.5 + 0.5 * np.sin(
+        np.linspace(0, 2 * np.pi * 7, size)[None, :] * np.ones((size, 1))
+        + noise(size, 5.0, rng) * 6.0)
+    img = mix((78, 70, 62), (126, 116, 104), 0.25 + 0.6 * ridge)
+    img = img * (0.78 + 0.4 * fissure)[..., None]
+    lichen = np.clip((noise(size, size / 16.0, rng) - 0.70) * 4.0, 0, 1)
+    return np.clip(mix(img, (150, 156, 130), lichen * 0.5), 0, 255)
+
+
+def foliage(size, rng, tint=(1.0, 1.0, 1.0)):
+    """Leaf cover for the canopy spheres.
+
+    Not a leaf photograph: these are spheres, and a single big leaf wrapped
+    round one looks worse than no texture at all. What a canopy needs from two
+    metres up is the right *statistics* - clumps of light and shade at leaf
+    scale, so the surface breaks up instead of shading like a billiard ball.
+    """
+    # Feature size is set relative to the image because this texture is mapped
+    # ONCE round a canopy sphere, not tiled across it - tiling a sphere puts
+    # visible seams where the wrap meets itself, and on a 0.4 m ball those
+    # seams read as square patches of leaf. Mapped once, a clump blurred over
+    # an eighth of the image comes out about 5 cm across on the sphere, which
+    # is roughly a leaf.
+    clump = noise(size, size / 8.0, rng)
+    mid = noise(size, size / 26.0, rng)
+    fine = noise(size, 1.6, rng)
+    img = mix((32, 62, 22), (96, 138, 52), 0.15 + 0.5 * clump + 0.35 * mid)
+    img = img * (0.78 + 0.34 * fine)[..., None]
+    # A few gaps where shadow shows through the leaves.
+    gap = np.clip((noise(size, size / 20.0, rng) - 0.70) * 4.0, 0, 1)
+    img = mix(img, (22, 34, 18), gap * 0.8)
+    return np.clip(img * np.array(tint), 0, 255)
+
+
+def timber(size, rng):
+    """Weathered sawn wood: fruit bins, fence posts, the shed."""
+    grain = noise(size, 0.8, rng)
+    rings = 0.5 + 0.5 * np.sin(
+        np.linspace(0, 2 * np.pi * 8, size)[None, :] * np.ones((size, 1))
+        + noise(size, 6.0, rng) * 5.0)
+    img = mix((74, 63, 50), (118, 103, 84), 0.3 + 0.55 * rings)
+    return np.clip(img * (0.86 + 0.28 * grain)[..., None], 0, 255)
+
+
+def metal_sheet(size, rng):
+    """Galvanised sheet: the shed roof and the water tank."""
+    ribs = 0.5 + 0.5 * np.sin(
+        np.linspace(0, 2 * np.pi * 16, size)[None, :] * np.ones((size, 1)))
+    img = mix((122, 126, 130), (194, 198, 201), ribs)
+    # Rust, kept desaturated on purpose - rust is the one weathering effect
+    # that is genuinely orange, and orange is what the detector hunts.
+    rust = np.clip((noise(size, size / 11.0, rng) - 0.72) * 4.0, 0, 1)
+    img = mix(img, (132, 106, 88), rust * 0.6)
+    return np.clip(img * (0.95 + 0.1 * noise(size, 1.0, rng))[..., None], 0, 255)
+
+
+# Four foliage variants rather than one. The trees are otherwise built from the
+# same handful of primitives, and a block of forty of them in one identical
+# green reads as wallpaper - which is the reason the orchard generator picked a
+# random leaf shade per foliage sphere before any of this was textured. Keeping
+# four textures keeps that variation, and keeps the generator's random draw
+# per sphere, so the fruit still lands exactly where it did.
+FOLIAGE_TINTS = ((1.00, 1.00, 1.00), (0.88, 1.02, 0.86),
+                 (1.10, 0.96, 0.92), (0.94, 0.92, 1.04))
+
+LAYERS = {
+    'grass_sward': grass_sward,
+    'herbicide_strip': herbicide_strip,
+    'bark': bark,
+    'timber': timber,
+    'metal_sheet': metal_sheet,
+}
+for _i, _t in enumerate(FOLIAGE_TINTS):
+    LAYERS['foliage%d' % _i] = (
+        lambda size, rng, t=_t: foliage(size, rng, t))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--out', default=OUT)
+    ap.add_argument('--size', type=int, default=256)
+    ap.add_argument('--force', action='store_true',
+                    help='write even if a texture could be read as fruit')
+    args = ap.parse_args()
+
+    if not os.path.isdir(args.out):
+        os.makedirs(args.out)
+    rng = np.random.default_rng(SEED)
+
+    limit = SAT_MIN - SAT_HEADROOM
+    bad = []
+    print('%-16s %-18s %-10s %s' % ('texture', 'mean rgb', 'worst red',
+                                    'reads as fruit'))
+    for name in sorted(LAYERS):
+        data = LAYERS[name](args.size, rng)
+        peak = worst_red_saturation(data)
+        share = fruit_like(data)
+        flag = ''
+        if share > 0.0 or peak > limit:
+            flag = '   <-- TOO CLOSE'
+            bad.append((name, peak, share))
+        mean = data.reshape(-1, 3).mean(axis=0)
+        print('%-16s (%3.0f,%3.0f,%3.0f)      %5.0f/%d   %.4f%s'
+              % (name, mean[0], mean[1], mean[2], peak, limit, share, flag))
+        Image.fromarray(data.astype(np.uint8), 'RGB').save(
+            os.path.join(args.out, name + '.png'), optimize=True)
+
+    if bad and not args.force:
+        print('\nRefusing to leave these as they are: a surface the detector '
+              'could read as an apple\nis a false positive in every frame it '
+              'appears in. Desaturate them or pass --force.')
+        return 1
+    print('\n%d textures -> %s' % (len(LAYERS), args.out))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

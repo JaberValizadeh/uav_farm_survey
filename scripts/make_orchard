@@ -1,0 +1,875 @@
+#!/usr/bin/env python3
+"""
+make_orchard - generate an apple orchard, and the ground truth that scores it.
+
+Writes two files that have to agree with each other:
+
+  worlds/orchard.world        what Gazebo shows the drone
+  config/orchard_truth.yaml   where every apple actually is
+
+They agree because they come out of one pass of one loop. That matters more
+here than in the other packages in this workspace: this scenario is not "did
+the robot get somewhere", it is "did the robot find things", and there is no
+way to answer that without a list of what was there.
+
+The truth file is *not* an input to the robot. survey_pilot and fruit_detector
+never read it. Only orchard_map does, and only to score itself afterwards.
+
+Building a tree out of primitives
+---------------------------------
+There is no model database on this machine and no tree meshes anywhere in the
+workspace, so an apple tree here is cylinders and spheres. Four things are what
+stop it looking like a lollipop on a stick:
+
+  a tapered trunk    three stacked cylinders of decreasing radius with a slight
+                     lean, not one straight tube. Real trunks are neither
+                     uniform nor vertical and the eye knows it.
+  real branches      five or six angled cylinders from the crown of the trunk,
+                     at irregular bearings and elevations.
+  a layered canopy   twelve to eighteen overlapping spheres of varying size and
+                     slightly varying green, clustered around the branch ends -
+                     never one big sphere. The silhouette is the whole tell:
+                     one sphere reads as a ball, a cluster reads as foliage.
+  variation          every tree gets its own height, lean, canopy density and
+                     green. A row of identical trees looks like wallpaper.
+
+Apples get a specular highlight, which is most of what makes a red sphere read
+as fruit rather than as a marker, and a short brown stem.
+
+The constraint that governs everything
+--------------------------------------
+The sensor is a camera looking straight down, so an apple inside the canopy is
+not something this robot could ever find. That is not a detail - a previous
+version of this farm placed fruit at a fixed height that happened to be inside
+the foliage, and the survey scored 42.9% recall while the detector was working
+perfectly. It was being marked down for geometry.
+
+So visibility is *checked*, not hoped for. Every apple is placed on the outer
+surface of the canopy and then a ray is cast straight up from it: if that ray
+passes through any foliage sphere, the position is rejected and another tried.
+What survives is guaranteed visible from above, which is what makes the recall
+figure mean something.
+
+That is also an honest limit of the scenario rather than a fudge. Real orchards
+hide most of their fruit under leaves, and a downward camera genuinely cannot
+find it - that wants a ground robot looking sideways, or a different sensor.
+This farm models the part of the problem the aircraft can actually do.
+
+Usage
+-----
+  rosrun uav_farm_survey make_orchard
+  rosrun uav_farm_survey make_orchard --seed 7 --rows 8 --trees 20
+
+The block is 6 rows of 16 by default. Nothing in the world is pinned to that
+size - the fence, the headland, the yard, the hives, the irrigation and the
+spawn point are all placed from the block's half-extents, so --rows and --trees
+move the whole farm rather than just adding trees inside a fixed fence. What
+that costs is the flight: one leg per row, so more rows is directly more time
+in the air, and the surveyed rectangle has to be told about it. The generator
+prints the launch arguments that match the world it just wrote.
+"""
+
+import argparse
+import math
+import os
+import random
+
+# ------------------------------------------------------------------ layout --
+ROW_DY      = 3.0           # apple trees need more room than bushes
+TREE_DX     = 2.2
+
+# ------------------------------------------------------------------- trees --
+TRUNK_H     = (0.85, 1.15)  # to the crown, where the branches start
+TRUNK_R     = (0.075, 0.10)
+CANOPY_R    = (0.85, 1.10)
+N_FOLIAGE   = (12, 18)
+N_BRANCH    = (5, 7)
+
+APPLE_R     = 0.055         # ~11 cm across, which is a real apple
+N_APPLE     = (3, 7)
+RIPE_FRACTION = 0.45
+APPLE_SEP   = 0.30          # least distance between two apples on one tree
+
+# Ripe apples vary; all firmly in the red hue band the detector looks for, but
+# no two the same shade, because a row of identical crimson dots is the other
+# way a generated world gives itself away.
+RIPE_SHADES = ((0.72, 0.05, 0.04), (0.80, 0.09, 0.05),
+               (0.62, 0.04, 0.03), (0.78, 0.14, 0.06))
+# Unripe apples are yellow-green - hue about 35 on OpenCV's scale, nowhere near
+# the red bands, so they are a genuine distractor rather than a borderline case
+# that would make the score a lottery.
+UNRIPE_SHADES = ((0.48, 0.62, 0.13), (0.55, 0.66, 0.16))
+# Foliage, bark, grass and the strip under the rows are textures now, not flat
+# colours - see scripts/make_orchard_textures, which owns those colours and
+# refuses to emit any surface fruit_detector could read as an apple.
+#
+# That check is not decoration. An earlier orchard had bark and soil at hue 14
+# and 15 on OpenCV's scale, four units off the detector's red threshold, and
+# clearing both its saturation and value guards - so every shadow that nudged a
+# pixel across the line became a false apple, 31 of them. The textures that
+# replaced them peak at saturation 52 and 63 against a floor of 160, which is a
+# guard that does not depend on a four-unit hue margin holding.
+
+
+# ------------------------------------------------------------- materials --
+#
+# Surfaces reference an Ogre material by name instead of carrying a flat
+# <diffuse>. That indirection is what lets bark be bark rather than a brown
+# cylinder: the texture lives in models/orchard and is generated by
+# make_orchard_textures, which refuses to emit anything fruit_detector could
+# read as an apple.
+#
+# The apples themselves stay flat colours with a specular highlight, and
+# deliberately so. They are the thing being detected; texturing them would
+# change the measurement, and a 5 cm sphere seen from 5.5 m is eleven pixels
+# across - there is nothing there to texture.
+
+SURFACE_MATERIAL = """
+material %s
+{
+  technique
+  {
+    pass
+    {
+      ambient %s 1.0
+      diffuse 0.94 0.94 0.94 1.0
+      specular %s
+      texture_unit
+      {
+        texture %s
+        scale %s
+        filtering trilinear
+      }
+    }
+  }
+}
+"""
+
+# name, texture, uv scale, ambient reflectance, specular
+#
+# The uv scale is how many times the texture repeats across the face it is on,
+# so it has to be read together with the size of that face - the grass box is
+# 66 m across and the strip under a row is 1.1 m wide, and the same number on
+# both would give one of them grains the size of a dinner plate. The target is
+# roughly a metre per tile on the ground, which is about 70 px at survey
+# altitude: fine enough to break up the surface, coarse enough not to alias
+# into a shimmer as the aircraft moves.
+SURFACES = (
+    ('Orchard/Grass',   'grass_sward.png',     '66 56', '0.62 0.62 0.62',
+     '0.02 0.02 0.02 1.0 1.0'),
+    ('Orchard/Strip',   'herbicide_strip.png', '44 2',  '0.60 0.60 0.60',
+     '0.02 0.02 0.02 1.0 1.0'),
+    ('Orchard/Track',   'herbicide_strip.png', '30 26', '0.60 0.60 0.60',
+     '0.02 0.02 0.02 1.0 1.0'),
+    ('Orchard/Bark',    'bark.png',            '1 3',   '0.62 0.62 0.62',
+     '0.03 0.03 0.03 1.0 2.0'),
+    ('Orchard/Foliage0', 'foliage0.png',       '1 1',   '0.66 0.66 0.66',
+     '0.04 0.04 0.04 1.0 4.0'),
+    ('Orchard/Foliage1', 'foliage1.png',       '1 1',   '0.66 0.66 0.66',
+     '0.04 0.04 0.04 1.0 4.0'),
+    ('Orchard/Foliage2', 'foliage2.png',       '1 1',   '0.66 0.66 0.66',
+     '0.04 0.04 0.04 1.0 4.0'),
+    ('Orchard/Foliage3', 'foliage3.png',       '1 1',   '0.66 0.66 0.66',
+     '0.04 0.04 0.04 1.0 4.0'),
+    ('Orchard/Timber',  'timber.png',          '3 3',   '0.62 0.62 0.62',
+     '0.03 0.03 0.03 1.0 2.0'),
+    ('Orchard/Metal',   'metal_sheet.png',     '3 2',   '0.64 0.64 0.64',
+     '0.10 0.10 0.10 1.0 8.0'),
+)
+
+MODEL_CONFIG = """<?xml version="1.0"?>
+<model>
+  <name>orchard</name>
+  <version>1.0</version>
+  <sdf version="1.6">model.sdf</sdf>
+  <description>
+    Materials and textures for the uav_farm_survey orchard. Not a model to
+    spawn: it exists so Gazebo can resolve the model:// URIs the world uses
+    for its materials.
+  </description>
+</model>
+"""
+
+MODEL_SDF = """<?xml version="1.0"?>
+<!-- Placeholder: this directory is a material library, not a spawnable model,
+     but Gazebo wants an SDF beside the model.config. -->
+<sdf version="1.6">
+  <model name="orchard"><static>true</static><link name="link"/></model>
+</sdf>
+"""
+
+
+def write_materials(pkg):
+    d = os.path.join(pkg, 'models', 'orchard')
+    scripts = os.path.join(d, 'materials', 'scripts')
+    for sub in (scripts, os.path.join(d, 'materials', 'textures')):
+        if not os.path.isdir(sub):
+            os.makedirs(sub)
+    text = ['// Generated by scripts/make_orchard - do not edit by hand.\n']
+    for name, tex, scale, amb, spec in SURFACES:
+        text.append(SURFACE_MATERIAL % (name, amb, spec, tex, scale))
+    with open(os.path.join(scripts, 'orchard.material'), 'w') as f:
+        f.write(''.join(text))
+    with open(os.path.join(d, 'model.config'), 'w') as f:
+        f.write(MODEL_CONFIG)
+    with open(os.path.join(d, 'model.sdf'), 'w') as f:
+        f.write(MODEL_SDF)
+
+
+FOLIAGE_MATS = ('Orchard/Foliage0', 'Orchard/Foliage1',
+                'Orchard/Foliage2', 'Orchard/Foliage3')
+
+
+def _smat(name):
+    """A textured material, by name."""
+    return ('<material><script>'
+            '<uri>model://orchard/materials/scripts</uri>'
+            '<uri>model://orchard/materials/textures</uri>'
+            '<name>%s</name></script></material>' % name)
+
+def _mat(rgb, spec=None, alpha=1.0):
+    r, g, b = rgb
+    s = ('<specular>%.2f %.2f %.2f 1</specular>' % spec) if spec else ''
+    return ('<material><ambient>%.3f %.3f %.3f %.2f</ambient>'
+            '<diffuse>%.3f %.3f %.3f %.2f</diffuse>%s</material>'
+            % (r * 0.40, g * 0.40, b * 0.40, alpha, r, g, b, alpha, s))
+
+
+def _link(name, pose, geom, mat, collide=False):
+    col = ('      <collision name="%s_c"><geometry>%s</geometry></collision>\n'
+           % (name, geom)) if collide else ''
+    return ('    <link name="%s">\n      <pose>%s</pose>\n%s'
+            '      <visual name="%s_v"><geometry>%s</geometry>%s</visual>\n'
+            '    </link>\n' % (name, pose, col, name, geom, mat))
+
+
+def _sphere(r):
+    return '<sphere><radius>%.4f</radius></sphere>' % r
+
+
+def _cyl(r, l):
+    return '<cylinder><radius>%.4f</radius><length>%.4f</length></cylinder>' % (r, l)
+
+
+class Tree(object):
+    """One apple tree: geometry, and the apples that are provably visible."""
+
+    def __init__(self, rng, tag, x, y):
+        self.tag, self.x, self.y = tag, x, y
+        self.links = []
+        self.apples = []                 # (x, y, z, ripe)
+        self.foliage = []                # (x, y, z, r) - for the ray test
+
+        self._trunk(rng)
+        self._branches(rng)
+        self._canopy(rng)
+        self._apples(rng)
+
+    # -- structure ---------------------------------------------------------
+    def _trunk(self, rng):
+        h = rng.uniform(*TRUNK_H)
+        r0 = rng.uniform(*TRUNK_R)
+        # A slight lean, consistent up the whole trunk, so the tree does not
+        # stand to attention.
+        self.lean = (rng.uniform(-0.06, 0.06), rng.uniform(-0.06, 0.06))
+        self.crown_z = h
+        seg = h / 3.0
+        for i in range(3):
+            r = r0 * (1.0 - 0.22 * i)           # taper: thicker at the base
+            z = seg * (i + 0.5)
+            dx, dy = self.lean[0] * z, self.lean[1] * z
+            self.links.append(_link(
+                '%s_trunk%d' % (self.tag, i),
+                '%.4f %.4f %.4f %.4f %.4f 0' % (self.x + dx, self.y + dy, z,
+                                                -self.lean[1], self.lean[0]),
+                _cyl(r, seg * 1.06), _smat('Orchard/Bark'), collide=(i == 0)))
+
+    def _branches(self, rng):
+        self.branch_tips = []
+        n = rng.randint(*N_BRANCH)
+        cx = self.x + self.lean[0] * self.crown_z
+        cy = self.y + self.lean[1] * self.crown_z
+        for i in range(n):
+            a = 2 * math.pi * i / n + rng.uniform(-0.35, 0.35)
+            elev = rng.uniform(0.42, 0.95)          # radians above horizontal
+            ln = rng.uniform(0.55, 0.85)
+            hx = math.cos(a) * math.cos(elev)
+            hy = math.sin(a) * math.cos(elev)
+            hz = math.sin(elev)
+            mx = cx + hx * ln / 2
+            my = cy + hy * ln / 2
+            mz = self.crown_z + hz * ln / 2
+            self.links.append(_link(
+                '%s_br%d' % (self.tag, i),
+                '%.4f %.4f %.4f %.4f %.4f %.4f'
+                % (mx, my, mz, 0.0, math.pi / 2 - elev, a),
+                _cyl(rng.uniform(0.022, 0.036), ln), _smat('Orchard/Bark')))
+            self.branch_tips.append((cx + hx * ln, cy + hy * ln,
+                                     self.crown_z + hz * ln))
+
+    def _canopy(self, rng):
+        self.canopy_r = rng.uniform(*CANOPY_R)
+        n = rng.randint(*N_FOLIAGE)
+        cz = self.crown_z + self.canopy_r * 0.55
+        cx = self.x + self.lean[0] * self.crown_z
+        cy = self.y + self.lean[1] * self.crown_z
+        for i in range(n):
+            # Cluster the foliage around the branch tips rather than scattering
+            # it in a ball: that is what gives the canopy a lumpy silhouette
+            # instead of a smooth sphere.
+            if self.branch_tips and rng.random() < 0.7:
+                bx, by, bz = rng.choice(self.branch_tips)
+                px = bx + rng.uniform(-0.28, 0.28)
+                py = by + rng.uniform(-0.28, 0.28)
+                pz = bz + rng.uniform(-0.10, 0.34)
+            else:
+                a = rng.uniform(0, 2 * math.pi)
+                rr = rng.uniform(0, self.canopy_r * 0.55)
+                px, py = cx + rr * math.cos(a), cy + rr * math.sin(a)
+                pz = cz + rng.uniform(-0.22, 0.30)
+            r = rng.uniform(0.34, 0.50)
+            self.foliage.append((px, py, pz, r))
+            self.links.append(_link(
+                '%s_fol%d' % (self.tag, i), '%.4f %.4f %.4f 0 0 0' % (px, py, pz),
+                # One draw per sphere, on a four-element sequence, exactly as
+                # when this picked a flat leaf colour - so the random stream
+                # stays in step and the fruit lands where it always did.
+                _sphere(r), _smat(rng.choice(FOLIAGE_MATS))))
+
+    # -- fruit -------------------------------------------------------------
+    def _visible_from_above(self, ax, ay, az):
+        """Can a camera directly overhead see an apple here?
+
+        A vertical ray from the apple: if it passes through any foliage sphere
+        that reaches higher than the apple does, the apple is under leaves and
+        the aircraft has no way to find it.
+
+        This is the check whose absence cost a previous version of this farm
+        more than half its recall, with the detector working correctly
+        throughout.
+        """
+        for fx, fy, fz, fr in self.foliage:
+            dh = math.hypot(ax - fx, ay - fy)
+            if dh >= fr - APPLE_R * 0.5:
+                continue                       # ray misses this sphere
+            top = fz + math.sqrt(max(fr * fr - dh * dh, 0.0))
+            if top > az + APPLE_R * 0.5:
+                return False                   # leaves above the apple
+        return True
+
+    def _apples(self, rng):
+        want = rng.randint(*N_APPLE)
+        placed = []
+        for k in range(want):
+            for _try in range(60):
+                # Hang the apple off the outside of a foliage sphere, biased
+                # upward and outward - both where a camera can see it and where
+                # fruit sets on a real tree, since that is where the light is.
+                fx, fy, fz, fr = rng.choice(self.foliage)
+                a = rng.uniform(0, 2 * math.pi)
+                elev = rng.uniform(0.35, 1.35)     # bias to the upper surface
+                ux = math.cos(a) * math.cos(elev)
+                uy = math.sin(a) * math.cos(elev)
+                uz = math.sin(elev)
+                d = fr + APPLE_R * 0.9
+                ax, ay, az = fx + ux * d, fy + uy * d, fz + uz * d
+                if az < self.crown_z * 0.8:
+                    continue                       # hanging under the tree
+                if not self._visible_from_above(ax, ay, az):
+                    continue
+                # Two apples the map cannot tell apart is a question with no
+                # right answer - orchard_map merges sightings within its merge
+                # radius, so a pair 5 cm apart is one apple as far as any
+                # survey could tell.
+                if any(math.hypot(ax - px, ay - py) < APPLE_SEP
+                       for px, py, _ in placed):
+                    continue
+                break
+            else:
+                continue
+
+            placed.append((ax, ay, az))
+            ripe = rng.random() < RIPE_FRACTION
+            shade = (rng.choice(RIPE_SHADES) if ripe
+                     else rng.choice(UNRIPE_SHADES))
+            self.links.append(_link(
+                '%s_ap%d' % (self.tag, k), '%.4f %.4f %.4f 0 0 0' % (ax, ay, az),
+                _sphere(APPLE_R),
+                # The highlight is what makes a red sphere read as fruit.
+                _mat(shade, spec=(0.45, 0.35, 0.32))))
+            # A short stem. Tiny, but it is the difference between an apple and
+            # a ball bearing when you look closely in the Gazebo window.
+            self.links.append(_link(
+                '%s_st%d' % (self.tag, k),
+                '%.4f %.4f %.4f 0 0 0' % (ax, ay, az + APPLE_R * 0.95),
+                _cyl(0.006, 0.05), _mat((0.32, 0.24, 0.10))))
+            self.apples.append((ax, ay, az, ripe))
+
+    def model(self):
+        return ('  <model name="%s">\n    <static>true</static>\n%s  </model>\n'
+                % (self.tag, ''.join(self.links)))
+
+
+def ground(x_half, y_half):
+    """The ground the whole farm stands on: mown orchard grass.
+
+    The stock Gazebo ground plane is a grey chequerboard, which is the single
+    most recognisable thing in a generated world - and here it also changes the
+    problem, because the detector's colour test has to work against whatever
+    the background actually is. Grass is the honest background for an orchard.
+
+    Laying a grass box over the chequerboard only hid the middle of it; the
+    squares still ran to the horizon in any wide shot. So this box is large
+    enough to be the ground everywhere the camera can see, and carries the
+    collision itself, which is what lets model://ground_plane be left out of
+    the world altogether.
+    """
+    return ('  <model name="ground_cover">\n    <static>true</static>\n%s  </model>\n'
+            % _link('grass', '0 0 0.005 0 0 0',
+                    '<box><size>%.2f %.2f 0.01</size></box>'
+                    % (2 * x_half + 44, 2 * y_half + 44),
+                    _smat('Orchard/Grass'), collide=True))
+
+
+def soil_strip(tag, y, x_half):
+    return ('  <model name="%s">\n    <static>true</static>\n%s  </model>\n'
+            % (tag, _link(tag + '_l', '0 %.3f 0.011 0 0 0' % y,
+                          '<box><size>%.2f 1.1 0.012</size></box>'
+                          % (2 * x_half + 1.0), _smat('Orchard/Strip'))))
+
+
+# ------------------------------------------------------------- the farm --
+#
+# An orchard is not a block of trees standing in a void. What follows is the rest of
+# the place: the deer fence, the headland track the tractor runs on, a shed and
+# a water tank, bulk bins waiting to be filled, hives at the edge for
+# pollination, and a windbreak along the weather side.
+#
+# Two rules govern all of it.
+#
+# Height: the aircraft surveys at 5.5 m, so nothing it flies over may reach
+# anywhere near that. The windbreak is the only tall thing here and it stands
+# outside the block, on the far side of the headland, where no leg goes.
+#
+# Colour: several of these sit inside the camera swath, and a bulk bin under
+# the aircraft is a large brown object in a scene where the robot is hunting
+# for brown-adjacent red. They are textured with the same checked materials as
+# everything else, and the bins in the alleys are there on purpose - a
+# specificity test that costs nothing, because if timber at saturation 71 ever
+# starts reading as fruit, the survey score says so immediately.
+
+# Everything below is placed from the block's own half-extents rather than
+# from a fixed number, because the block is not a fixed size: --rows/--trees
+# moves the outermost tree, and a fence, a shed and a set of hives that stayed
+# put would end up standing in the middle of a bigger orchard. The margins are
+# what is constant here, not the coordinates.
+FENCE_MARGIN = (4.1, 3.0)      # fence clearance beyond the block, x and y
+FIELD_MARGIN = 0.1             # the surveyed rectangle, past the last tree in x
+SPAWN_MARGIN = (0.5, 1.7)      # the aircraft starts this far outside the field
+
+
+def extents(x_half, y_half, row_y):
+    """Where the fence, the surveyed field and the aircraft go, for this block.
+
+    Returns (fence_x, fence_y), (field_x, field_y), (spawn_x, spawn_y).
+
+    The field is slightly wider in x than the outermost trees, so the aircraft
+    flies past the end of each row rather than turning on top of the last tree,
+    and is exactly the row span in y, because one leg flies one row. The spawn
+    sits outside that corner so the first leg starts where the pattern starts.
+    """
+    fence = (x_half + FENCE_MARGIN[0], y_half + FENCE_MARGIN[1])
+    field = (x_half + FIELD_MARGIN, abs(row_y[0]))
+    spawn = (-(field[0] + SPAWN_MARGIN[0]), -(field[1] + SPAWN_MARGIN[1]))
+    return fence, field, spawn
+
+
+def _box(sx, sy, sz):
+    return '<box><size>%.3f %.3f %.3f</size></box>' % (sx, sy, sz)
+
+
+def _model(tag, links):
+    return ('  <model name="%s">\n    <static>true</static>\n%s  </model>\n'
+            % (tag, ''.join(links)))
+
+
+def fence(fence_x, fence_y):
+    """Post and wire round the block. Deer eat orchards."""
+    links = []
+    i = 0
+    x = -fence_x
+    while x <= fence_x + 1e-6:
+        for y in (-fence_y, fence_y):
+            links.append(_link('post%d' % i, '%.3f %.3f 0.85 0 0 0' % (x, y),
+                               _cyl(0.055, 1.7), _smat('Orchard/Timber')))
+            i += 1
+        x += 3.0
+    y = -fence_y + 3.0
+    while y <= fence_y - 3.0 + 1e-6:
+        for x in (-fence_x, fence_x):
+            links.append(_link('post%d' % i, '%.3f %.3f 0.85 0 0 0' % (x, y),
+                               _cyl(0.055, 1.7), _smat('Orchard/Timber')))
+            i += 1
+        y += 3.0
+    # Wires: thin, and no collision. Something for the eye and for a wide shot,
+    # not something the aircraft can hit.
+    for j, z in enumerate((0.55, 1.05, 1.55)):
+        for y in (-fence_y, fence_y):
+            links.append(_link('wire%d_%d' % (j, int(y)),
+                               '0 %.3f %.3f 0 0 0' % (y, z),
+                               _box(2 * fence_x, 0.012, 0.012),
+                               _mat((0.34, 0.34, 0.36))))
+        for x in (-fence_x, fence_x):
+            links.append(_link('wire%d_x%d' % (j, int(x)),
+                               '%.3f 0 %.3f 0 0 0' % (x, z),
+                               _box(0.012, 2 * fence_y, 0.012),
+                               _mat((0.34, 0.34, 0.36))))
+    return _model('deer_fence', links)
+
+
+def headland(x_half, y_half):
+    """The bare track round the outside, where the tractor turns."""
+    links = []
+    ring = 2.2
+    ox, oy = x_half + ring, y_half + ring
+    for tag, pose, geom in (
+            ('n', '0 %.3f 0.013 0 0 0' % oy, _box(2 * ox, ring, 0.014)),
+            ('s', '0 %.3f 0.013 0 0 0' % -oy, _box(2 * ox, ring, 0.014)),
+            ('e', '%.3f 0 0.013 0 0 0' % ox, _box(ring, 2 * oy, 0.014)),
+            ('w', '%.3f 0 0.013 0 0 0' % -ox, _box(ring, 2 * oy, 0.014))):
+        links.append(_link('track_' + tag, pose, geom, _smat('Orchard/Track')))
+    return _model('headland_track', links)
+
+
+def yard(fence_x, fence_y):
+    """Shed, tank and a stack of bins in the corner furthest from the spawn.
+
+    Tucked into the fence corner rather than placed at an absolute coordinate,
+    so a bigger block pushes the yard out with the fence instead of leaving a
+    packing shed standing between two rows of trees.
+    """
+    out = []
+    sx, sy = -(fence_x - 1.4), fence_y - 1.6
+    shed = [
+        _link('walls', '%.3f %.3f 1.20 0 0 0.18' % (sx, sy), _box(4.2, 3.0, 2.4),
+              _smat('Orchard/Timber'), collide=True),
+        _link('roof', '%.3f %.3f 2.47 0 0 0.18' % (sx, sy), _box(4.7, 3.5, 0.14),
+              _smat('Orchard/Metal')),
+    ]
+    out.append(_model('packing_shed', shed))
+    out.append(_model('water_tank', [
+        _link('drum', '%.3f %.3f 1.00 0 0 0' % (sx + 3.2, sy + 0.3),
+              _cyl(0.95, 2.0), _smat('Orchard/Metal'), collide=True)]))
+    return out
+
+
+def bins(rng, row_y, x_half, spawn):
+    """Bulk bins: the wooden crates apples are picked into.
+
+    A few sit in the alleys between rows, directly under the survey camera.
+    That is the point of them - see the note above.
+    """
+    out = []
+    n = 0
+    spots = []
+    # Stacked pairs at each headland, out of the aircraft's way.
+    for x in (-x_half - 1.4, x_half + 1.4):
+        for y in (-2.0, 2.0):
+            spots.append((x, y, 2))
+    # Singles in the alleys between rows, in shot.
+    alleys = [(row_y[i] + row_y[i + 1]) / 2.0 for i in range(len(row_y) - 1)]
+    # Along the alley, but clear of the headland turns at either end - which
+    # is a span of the block rather than a fixed +/-7 m, or a longer row would
+    # keep dropping its bins in the same middle third.
+    reach = max(x_half - 3.9, 1.0)
+    for alley in alleys:
+        spots.append((rng.uniform(-reach, reach), alley + rng.uniform(-.3, .3), 1))
+    for x, y, stack in spots:
+        if math.hypot(x - spawn[0], y - spawn[1]) < 2.5:
+            continue                       # never in the aircraft's way
+        links = []
+        yaw = rng.uniform(0, 3.14)
+        for k in range(stack):
+            links.append(_link(
+                'crate%d' % k,
+                '%.3f %.3f %.3f 0 0 %.3f' % (x, y, 0.38 + k * 0.76, yaw),
+                _box(1.15, 1.15, 0.74), _smat('Orchard/Timber'),
+                collide=(k == 0)))
+        out.append(_model('bin_%d' % n, links))
+        n += 1
+    return out
+
+
+def hives(fence_x, fence_y):
+    """Beehives at the edge. No orchard sets fruit without them."""
+    links = []
+    for i in range(4):
+        x = fence_x - 2.6 + (i % 2) * 1.1
+        y = fence_y - 2.4 + (i // 2) * 1.2
+        links.append(_link('stand%d' % i, '%.3f %.3f 0.14 0 0 0' % (x, y),
+                           _box(0.60, 0.50, 0.28), _smat('Orchard/Timber')))
+        # Pale, low-saturation boxes - hives are painted white to keep them
+        # cool, which happens also to be about as far from ripe fruit as a
+        # colour can get.
+        links.append(_link('hive%d' % i, '%.3f %.3f 0.60 0 0 0' % (x, y),
+                           _box(0.52, 0.44, 0.64), _mat((0.80, 0.79, 0.74))))
+        links.append(_link('lid%d' % i, '%.3f %.3f 0.95 0 0 0' % (x, y),
+                           _box(0.58, 0.50, 0.06), _smat('Orchard/Metal')))
+    return _model('bee_hives', links)
+
+
+def irrigation(row_y, x_half):
+    """A drip line down each row, and the header that feeds them."""
+    # A cylinder's axis is z, so laying one along the y axis is a *roll* of
+    # pi/2, not a yaw. Yawing it leaves it standing upright: this header
+    # started life as a 10.5 m black pole through the middle of the orchard,
+    # sticking up past the survey altitude, and it took a wide shot to notice
+    # because from directly above a vertical pole looks exactly like the pipe
+    # it was supposed to be.
+    links = [_link('header', '%.3f 0 0.05 1.5708 0 0' % (-x_half - 1.0),
+                   _cyl(0.035, 2 * abs(row_y[0]) + 1.5),
+                   _mat((0.16, 0.16, 0.17)))]
+    for i, y in enumerate(row_y):
+        links.append(_link('drip%d' % i, '0 %.3f 0.028 0 1.5708 0' % (y - 0.42),
+                           _cyl(0.016, 2 * x_half + 1.0),
+                           _mat((0.16, 0.16, 0.17))))
+    return _model('irrigation', links)
+
+
+def windbreak(rng, y, x_from, x_to):
+    """A row of tall narrow trees on the weather side.
+
+    Height is the constraint: these top out around 4.5 m and the aircraft
+    surveys at 5.5 m, which is not much clearance - so what actually keeps them
+    apart is that no leg ever comes here. The caller places this row beyond the
+    headland, off the end of the block, and both numbers move with --rows: at
+    the default 6 rows the last leg flies y = 7.5 and this stands at y = 12.7.
+    """
+    out = []
+    x = x_from
+    i = 0
+    while x <= x_to + 1e-6:
+        h = rng.uniform(1.5, 1.9)
+        links = [_link('trunk', '%.3f %.3f %.3f 0 0 0' % (x, y, h / 2),
+                       _cyl(0.09, h), _smat('Orchard/Bark'), collide=True)]
+        # Columnar, not conical. Spheres of steadily shrinking radius stack
+        # into a Christmas tree, which is the wrong plant entirely - a poplar
+        # windbreak is a narrow column that only tapers at the very top.
+        for k in range(5):
+            z = h + 0.34 + k * 0.46
+            r = 0.62 if k < 4 else 0.40
+            links.append(_link(
+                'crown%d' % k,
+                '%.3f %.3f %.3f 0 0 0' % (x + rng.uniform(-0.09, 0.09),
+                                          y + rng.uniform(-0.09, 0.09), z),
+                _sphere(r), _smat(rng.choice(FOLIAGE_MATS))))
+        out.append(_model('windbreak_%d' % i, links))
+        x += 2.5
+        i += 1
+    return out
+
+HEADER = """<?xml version="1.0"?>
+<!-- An apple orchard, generated by scripts/make_orchard.
+
+     Rows of apple trees on grass, with bare soil under each row. Every tree is
+     built from primitives - there is no model database on this machine - but
+     built to look like a tree rather than a lollipop: a tapered leaning trunk,
+     five or six angled branches, and a dozen or more overlapping foliage
+     spheres of varying size and green clustered around the branch tips. Each
+     tree has its own height, lean, canopy and colour, because a row of
+     identical trees reads as wallpaper.
+
+     The apples are on the OUTSIDE of the canopy, and that is enforced rather
+     than hoped for. The sensor is a camera looking straight down, so fruit
+     under leaves is fruit this robot cannot possibly find: a previous version
+     of this farm put fruit at a fixed height that happened to be inside the
+     foliage, and the survey scored 42.9% recall with a detector that was
+     working perfectly. So every apple has a ray cast straight up from it as it
+     is placed, and any position where that ray passes through foliage is
+     rejected.
+
+     That is a real limit of the scenario, stated rather than hidden: a real
+     orchard hides most of its fruit under leaves and no downward camera will
+     ever find it. This farm models the part of the job an aircraft can do.
+
+     Regenerate:  rosrun uav_farm_survey make_orchard (seed N)
+     Do not hand-edit - config/orchard_truth.yaml comes out of the same loop
+     and the two have to agree, or the survey is scored against a different
+     orchard from the one it flew over. -->
+<sdf version="1.6">
+  <world name="default">
+
+    <!-- No model://ground_plane. Its grey chequerboard is the single most
+         recognisable thing in a generated Gazebo world, and the grass laid
+         over it only hid the middle - the squares still ran out to the
+         horizon in any wide shot. The grass box carries the collision now.
+
+         Two lights, not one. Outdoors, the sky fills shadow from every
+         direction at once, and a lone directional sun leaves the underside of
+         a canopy nearly black - which is both wrong to look at and a real
+         problem for a colour detector, since a dark red apple in shadow drops
+         below the value floor and stops being fruit. The fill is weak, cool,
+         from the opposite side, and casts no shadows of its own.
+
+         Note that a Gazebo camera sensor does NOT take its light from
+         scene/ambient below; that setting is the viewer's. Raising it changes
+         what you see in the Gazebo window and changes the survey not at all.
+         The fill light is what the camera sees. -->
+    <light name="sun" type="directional">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 20 0 0 0</pose>
+      <diffuse>0.88 0.86 0.80 1</diffuse>
+      <specular>0.20 0.20 0.18 1</specular>
+      <direction>-0.40 0.36 -0.84</direction>
+      <attenuation>
+        <range>80</range><constant>0.9</constant><linear>0.01</linear>
+      </attenuation>
+    </light>
+
+    <light name="sky_fill" type="directional">
+      <cast_shadows>false</cast_shadows>
+      <pose>0 0 24 0 0 0</pose>
+      <diffuse>0.40 0.42 0.48 1</diffuse>
+      <specular>0.02 0.02 0.03 1</specular>
+      <direction>0.50 -0.44 -0.75</direction>
+      <attenuation>
+        <range>80</range><constant>0.9</constant><linear>0.01</linear>
+      </attenuation>
+    </light>
+
+    <scene>
+      <ambient>0.70 0.70 0.72 1</ambient>
+      <background>0.62 0.74 0.88 1</background>
+      <shadows>true</shadows>
+    </scene>
+
+    <physics type="ode">
+      <max_step_size>0.001</max_step_size>
+      <real_time_update_rate>1000</real_time_update_rate>
+    </physics>
+
+"""
+
+FOOTER = """
+    <gui>
+      <camera name="user_camera">
+        <pose>-15 -13 9 0 0.45 0.72</pose>
+      </camera>
+    </gui>
+
+  </world>
+</sdf>
+"""
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--seed', type=int, default=5)
+    ap.add_argument('--rows', type=int, default=6)
+    ap.add_argument('--trees', type=int, default=16)
+    ap.add_argument('--pkg', default=os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), '..'))
+    args = ap.parse_args()
+
+    rng = random.Random(args.seed)
+    row_y = [(-(args.rows - 1) / 2.0 + i) * ROW_DY for i in range(args.rows)]
+    x0 = -(args.trees - 1) / 2.0 * TREE_DX
+
+    models, truth = [], []
+    fid = 0
+    for ri, ry in enumerate(row_y):
+        for ti in range(args.trees):
+            tx = x0 + ti * TREE_DX + rng.uniform(-0.12, 0.12)
+            ty = ry + rng.uniform(-0.12, 0.12)
+            t = Tree(rng, 'tree_r%d_t%d' % (ri, ti), tx, ty)
+            models.append(t.model())
+            for ax, ay, az, ripe in t.apples:
+                truth.append((fid, ax, ay, az, ripe))
+                fid += 1
+
+    x_half = abs(x0) + 1.0
+    y_half = abs(row_y[0]) + 1.5
+    (fence_x, fence_y), field, spawn = extents(x_half, y_half, row_y)
+    pre = [ground(x_half, y_half), headland(x_half, y_half)]
+    for ri, ry in enumerate(row_y):
+        pre.append(soil_strip('soil_%d' % ri, ry, x_half))
+
+    # The rest of the farm. Built from its own generator, seeded separately and
+    # drawn after the trees, so that adding a beehive cannot shift the random
+    # sequence that placed the fruit - the truth file has to stay comparable
+    # across a change that was only ever about how the place looks.
+    frng = random.Random(args.seed + 1000)
+    post = [fence(fence_x, fence_y), hives(fence_x, fence_y),
+            irrigation(row_y, x_half)]
+    post += yard(fence_x, fence_y)
+    post += bins(frng, row_y, x_half, spawn)
+    post += windbreak(frng, y_half + 3.7, -fence_x + 1.5, fence_x - 1.5)
+
+    header = HEADER
+    body = header[header.index('<!--') + 4:header.index('-->')]
+    if '--' in body:                    # XML comments cannot contain one
+        header = header.replace(body, body.replace('--', '-'))
+
+    write_materials(args.pkg)
+    with open(os.path.join(args.pkg, 'worlds', 'orchard.world'), 'w') as f:
+        f.write(header + ''.join(pre) + ''.join(models) + ''.join(post)
+                + FOOTER)
+
+    ripe = [t for t in truth if t[4]]
+    zs = [t[3] for t in truth]
+    with open(os.path.join(args.pkg, 'config', 'orchard_truth.yaml'), 'w') as f:
+        f.write('# Ground truth for worlds/orchard.world - generated, do not edit.\n'
+                '# Written by the same loop that placed the apples, so the two\n'
+                '# cannot drift apart. Read only by orchard_map, and only to score\n'
+                '# the survey afterwards: nothing that flies or detects opens it.\n')
+        f.write('seed: %d\n' % args.seed)
+        f.write('fruit_radius: %.4f\n' % APPLE_R)
+        f.write('fruit_z_min: %.3f\n' % min(zs))
+        f.write('fruit_z_max: %.3f\n' % max(zs))
+        f.write('fruit_z_mean: %.3f\n' % (sum(zs) / len(zs)))
+        f.write('row_y: [%s]\n' % ', '.join('%.2f' % y for y in row_y))
+        f.write('ripe: [\n')
+        for i, x, y, z, _ in ripe:
+            f.write('  [%d, %.4f, %.4f],\n' % (i, x, y))
+        f.write(']\n')
+        f.write('unripe: [\n')
+        for i, x, y, z, r in truth:
+            if not r:
+                f.write('  [%d, %.4f, %.4f],\n' % (i, x, y))
+        f.write(']\n')
+
+    n_trees = args.rows * args.trees
+    print('orchard: %d rows x %d trees = %d apple trees'
+          % (args.rows, args.trees, n_trees))
+    print('  apples: %d (%d ripe, %d unripe), every one verified visible from above'
+          % (len(truth), len(ripe), len(truth) - len(ripe)))
+    print('  apple height: %.2f..%.2f m, mean %.2f'
+          % (min(zs), max(zs), sum(zs) / len(zs)))
+    print('  -> fly above %.1f m; set fruit_plane_z to %.2f'
+          % (max(zs) + 2.5, sum(zs) / len(zs)))
+    print('  -> rows at y = %s, leg_spacing %.1f'
+          % (', '.join('%.1f' % y for y in row_y), ROW_DY))
+    print('  farm: %.1f x %.1f m inside a %.1f x %.1f m fence, headland track, '
+          'shed, tank,\n        %d bins, hives, irrigation, windbreak'
+          % (2 * x_half, 2 * y_half, 2 * fence_x, 2 * fence_y,
+             len([m for m in post if 'bin_' in m[:24]])))
+
+    # The world and the flight plan are separate files, and this is the seam
+    # between them: a block this size only gets surveyed if the pilot is told
+    # to cover it. Print the numbers rather than leaving them to be worked out,
+    # because a field left at the old size flies a correct pattern over part of
+    # the orchard and scores every unvisited row as a miss.
+    print('\n  launch arguments for this farm (defaults in survey_robot.launch):')
+    print('    field_x_min:=%.1f field_x_max:=%.1f '
+          'field_y_min:=%.1f field_y_max:=%.1f'
+          % (-field[0], field[0], -field[1], field[1]))
+    print('    spawn_x:=%.1f spawn_y:=%.1f  leg_spacing:=%.1f  '
+          'fruit_plane_z:=%.2f' % (spawn[0], spawn[1], ROW_DY,
+                                   sum(zs) / len(zs)))
+    print('    %d legs of %.1f m at %.1f m/s ~ %.0f s in the air'
+          % (args.rows, 2 * field[0], 1.2,
+             (args.rows * 2 * field[0] + (args.rows - 1) * ROW_DY) / 1.2))
+
+
+if __name__ == '__main__':
+    main()

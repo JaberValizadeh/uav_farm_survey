@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>uav_farm_survey</name>
+  <version>1.0.0</version>
+  <description>
+    A single hector quadrotor surveying an orchard row by row with a
+    downward-looking camera, finding ripe fruit by colour and reporting where
+    each one is in world coordinates.
+
+    The point of the package is that the fruit positions are never told to the
+    robot. The world is generated, so the true position of every berry is known
+    and written to config/orchard_truth.yaml - but that file exists so the run
+    can be *scored*, not so the drone can cheat. What the drone gets is an
+    image, its own pose, and a camera model.
+  </description>
+
+  <maintainer email="valizadeh.au@gmail.com">Jaber</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <build_depend>message_generation</build_depend>
+  <exec_depend>message_runtime</exec_depend>
+
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>tf</depend>
+
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>image_transport</exec_depend>
+  <exec_depend>gazebo_ros</exec_depend>
+  <exec_depend>hector_quadrotor_gazebo</exec_depend>
+  <exec_depend>hector_sensors_description</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>rviz</exec_depend>
+  <!-- make_orchard_textures only: numpy and scipy for the noise fields, PIL to
+       write the PNGs. Nothing that flies or detects needs them. -->
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-pil</exec_depend>
+</package>

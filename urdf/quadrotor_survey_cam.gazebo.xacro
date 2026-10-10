@@ -1,0 +1,87 @@
+<?xml version="1.0"?>
+<!--
+  hector's quadrotor with a downward-looking survey camera.
+
+  No laser. Every other package in this workspace hangs a scanner on this
+  airframe because the aircraft has to get through timber; a survey drone flies
+  a lawnmower pattern four metres above a field of half-metre bushes, so the
+  only thing in its way is the ground. Carrying a Hokuyo it never reads would
+  be 181 rays a scan of physics spent on nothing.
+
+  Where the camera points, and why the mounting angle is the whole thing
+  .....................................................................
+  Straight down. hector's generic_camera macro follows Gazebo's convention -
+  the sensor looks along +x of its own link - and then hangs a standard
+  REP-103 optical frame off it, rotated by (-90, 0, -90), in which z is the
+  optical axis, x is image-right and y is image-down.
+
+  Mounting the link with rpy = (0, pi/2, 0) rotates it about body y by 90
+  degrees, which lands the chain here:
+
+      camera link +x  ->  body -z   (down)      so the optical axis looks down
+      camera link +y  ->  body +y
+      camera link +z  ->  body +x
+
+  and therefore, in the optical frame:
+
+      image right (+u) ->  body -y
+      image down  (+v) ->  body -x
+
+  Those two lines are the entire pixel-to-world projection, and getting either
+  sign wrong produces a survey that is confidently, symmetrically wrong - every
+  fruit reported mirrored about the flight line, which looks like a plausible
+  map until you compare it with the ground truth. fruit_detector derives its
+  arithmetic from exactly this block; if the mounting changes, that changes.
+
+  The camera sits 0.06 m below base_link so it is not looking through the
+  airframe, and that offset is subtracted from the aircraft's altitude when the
+  detector works out how far away the fruit plane is.
+
+  Resolution and rate
+  ...................
+  640 x 480 at 10 Hz. At the 4 m survey altitude the ground sample is about
+  9 mm per pixel, so a 0.18 m berry is around twenty pixels across - big enough
+  to threshold and blob without being big enough to be worth more resolution.
+  10 Hz against a 1.2 m/s ground speed is a frame every 0.12 m, so every fruit
+  is seen in dozens of frames and no single bad one matters.
+-->
+<robot name="quadrotor" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:property name="M_PI" value="3.1415926535897931" />
+
+  <xacro:include filename="$(find hector_quadrotor_description)/urdf/quadrotor_base.urdf.xacro" />
+  <xacro:quadrotor_base_macro />
+
+  <!-- The mount. Cosmetic, but a real link with a real (tiny) mass so the
+       inertia the solver sees is the one the model declares. -->
+  <link name="cam_mount">
+    <inertial>
+      <mass value="0.01" />
+      <origin xyz="0 0 0" />
+      <inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry><box size="0.05 0.05 0.03" /></geometry>
+      <material name="cam_grey"><color rgba="0.15 0.15 0.17 1.0" /></material>
+    </visual>
+  </link>
+
+  <joint name="cam_mount_joint" type="fixed">
+    <parent link="base_link" />
+    <child  link="cam_mount" />
+    <origin xyz="0 0 -0.06" rpy="0 0 0" />
+  </joint>
+
+  <xacro:include filename="$(find hector_sensors_description)/urdf/generic_camera.urdf.xacro" />
+  <xacro:generic_camera name="survey_cam" parent="base_link"
+                        ros_topic="image_raw" cam_info_topic="camera_info"
+                        update_rate="10" res_x="640" res_y="480"
+                        image_format="R8G8B8" hfov="80">
+    <!-- pitch +90 degrees: see the header. This one number is the projection. -->
+    <origin xyz="0 0 -0.06" rpy="0 ${M_PI/2} 0" />
+  </xacro:generic_camera>
+
+  <xacro:include filename="$(find hector_quadrotor_gazebo)/urdf/quadrotor_plugins.gazebo.xacro" />
+
+</robot>

@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<!--
+  farm_rqt.launch
+  ===============
+  Step 4 of 4: what the robot can see.
+
+    roslaunch uav_farm_survey farm_rqt.launch
+
+  Opens rqt_image_view on the annotated stream rather than the raw one:
+
+    - everything the colour test accepted is tinted, including blobs later
+      rejected on area or roundness. That is the difference between "the
+      threshold is wrong" and "the filters are too tight" when a run goes badly.
+    - accepted apples are ringed and labelled with the position the survey is
+      about to report and the range it decided on - green when that range was
+      measured from the apple's apparent size, amber when it fell back to the
+      assumed plane.
+    - a HUD with the count in frame, altitude over the plane, and running totals
+    - a crosshair on the one pixel where the projection has no lever arm at all
+
+  The view is empty until the drone is above min_range (0.8 m over the fruit
+  plane), because below that the detector returns early rather than reporting
+  its own landing gear. An empty window during takeoff is correct.
+
+  raw:=true to watch the unannotated camera instead.
+
+  Safe to start, kill and restart at any point in a run.
+-->
+<launch>
+
+  <arg name="ns"  default="uav_0" />
+  <arg name="raw" default="false" doc="the plain camera instead of the annotated view" />
+
+  <!-- 0 when started by hand, because by then the topic is already there.
+       The all-in-one launch passes a delay instead: rqt_image_view resolves
+       the topic given on its command line at startup, so opening it before the
+       detector exists leaves an empty viewer with the topic unselected. -->
+  <arg name="delay" default="0" />
+
+  <arg     if="$(arg raw)" name="topic" value="/$(arg ns)/survey_cam/image_raw" />
+  <arg unless="$(arg raw)" name="topic" value="/$(arg ns)/detections/image" />
+
+  <node name="camera_view" pkg="rqt_image_view" type="rqt_image_view"
+        args="$(arg topic)" output="screen" required="false"
+        launch-prefix="bash -c 'sleep $(arg delay) &amp;&amp; exec &quot;$0&quot; &quot;$@&quot;' --" />
+
+</launch>

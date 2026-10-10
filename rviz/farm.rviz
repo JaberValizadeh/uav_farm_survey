@@ -1,0 +1,170 @@
+Panels:
+  - Class: rviz/Displays
+    Help Height: 78
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Ripe fruit1
+        - /Survey path1
+      Splitter Ratio: 0.5
+    Tree Height: 719
+  - Class: rviz/Views
+    Expanded:
+      - /Current View1
+    Name: Views
+    Splitter Ratio: 0.5
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.5
+      Cell Size: 1
+      Class: rviz/Grid
+      Color: 160; 160; 164
+      Enabled: true
+      Line Style:
+        Line Width: 0.029999999329447746
+        Value: Lines
+      Name: Grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 26
+      Reference Frame: world
+      Value: true
+
+    - Alpha: 1
+      Class: rviz/RobotModel
+      Collision Enabled: false
+      Enabled: true
+      Links:
+        All Links Enabled: true
+        Expand Joint Details: false
+        Expand Link Details: false
+        Expand Tree: false
+        Link Tree Style: Links in Alphabetic Order
+      Name: Quadrotor
+      Robot Description: /uav_0/robot_description
+      TF Prefix: uav_0
+      Update Interval: 0
+      Value: true
+      Visual Enabled: true
+
+    # The pattern the pilot planned, latched - so it is there however late RViz
+    # is started, which is the point of being able to launch this separately.
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 60; 160; 255
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: Survey path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /farm/survey_path
+      Unreliable: false
+      Value: true
+
+    # The map as it is built. orchard_map colours each marker by position
+    # spread, so a tight cluster seen many times and a soft one look different
+    # while the flight is still going on.
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /farm/markers
+      Name: Ripe fruit
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+
+    # What the detector is thinking, in the same window as the map. Off by
+    # default because farm_rqt.launch is the better place to watch it; turn it
+    # on when a report lands somewhere odd and the map alone will not say why.
+    - Class: rviz/Image
+      Enabled: false
+      Image Topic: /uav_0/detections/image
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: Camera view
+      Normalize Range: true
+      Queue Size: 2
+      Transport Hint: raw
+      Unreliable: false
+      Value: false
+
+    - Class: rviz/TF
+      Enabled: false
+      Frame Timeout: 15
+      Frames:
+        All Enabled: true
+      Marker Alpha: 1
+      Marker Scale: 1
+      Name: TF
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+      Tree:
+        {}
+      Update Interval: 0
+      Value: false
+
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Default Light: true
+    Fixed Frame: world
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz/Interact
+      Hide Inactive Objects: true
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+    - Class: rviz/FocusCamera
+    - Class: rviz/Measure
+  Value: true
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Distance: 34
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.05999999865889549
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05000000074505806
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.009999999776482582
+      Pitch: 1.0
+      Target Frame: world
+      Yaw: 4.7
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 1000
+  Hide Left Dock: false
+  Hide Right Dock: true
+  Width: 1600
+  X: 60
+  Y: 60

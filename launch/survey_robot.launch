@@ -1,0 +1,248 @@
+<?xml version="1.0"?>
+<!--
+  survey_robot.launch
+  ===================
+  Step 2 of 4: the aircraft and the three nodes that make it a survey.
+
+  Expects a world already running - see orchard_world.launch.
+
+    roslaunch uav_farm_survey survey_robot.launch
+
+  Spawns the airframe with its downward camera, then:
+
+    survey_pilot   - flies the boustrophedon, one leg per tree row
+    fruit_detector - red in HSV, blob, project pixel to a place on the farm
+    orchard_map    - merge repeat sightings, publish the map, score the run
+
+  Restartable, and that is the point of the split: tuning a parameter costs one
+  relaunch of this file instead of reloading 96 trees.
+
+  Reset the aircraft between runs:
+
+    rosrun uav_farm_survey reset_robot
+    roslaunch uav_farm_survey survey_robot.launch
+
+  Killing this launch stops its nodes but leaves the spawned model in gzserver,
+  because the model belongs to Gazebo rather than to the launch that asked for
+  it. Relaunching without the reset still flies - the old model is there with
+  its controllers loaded - but it logs
+
+    Spawn status: SpawnModel: Failure - entity already exists.
+
+  and the aircraft starts from wherever it was left rather than from the spawn
+  point.
+
+  Every tuning number below is an arg, so a sweep needs no edit:
+    roslaunch uav_farm_survey survey_robot.launch sat_min:=180
+    roslaunch uav_farm_survey survey_robot.launch range_from_size:=true
+-->
+<launch>
+
+  <arg name="ns" default="uav_0" />
+
+  <!-- How long to wait before starting the nodes. This is measured from launch
+       and has to cover the spawn plus the controllers coming up - the pilot
+       publishing cmd_vel into a controller that does not exist yet is silently
+       ignored, and the run starts with the aircraft sitting on the ground.
+
+       8 rather than the 20 the all-in-one launch uses, because there the same
+       clock also had to cover Gazebo loading 96 trees. Here the world is
+       already up. -->
+  <arg name="node_delay" default="8" />
+
+  <!-- Where the aircraft is put down. The corner of the field, so the first
+       leg starts where the pattern starts rather than crossing the crop to get
+       there. -->
+  <arg name="spawn_x" default="-18.1" />
+  <arg name="spawn_y" default="-9.2" />
+  <arg name="spawn_z" default="0.3" />
+
+  <!-- The field to cover. Slightly wider in x than the outermost trees so the
+       aircraft flies past the end of each row rather than turning on top of the
+       last tree, and exactly the row span in y.
+
+       These four belong to the world, not to taste: they are the block that
+       make_orchard just wrote, and it prints them when it runs. A field left
+       at the old size after regenerating a bigger farm still flies a perfectly
+       correct pattern - over part of the orchard - and scores every row it
+       never visited as a miss, which reads as a broken detector rather than as
+       a stale launch file. -->
+  <arg name="field_x_min" default="-17.6" />
+  <arg name="field_x_max" default="17.6" />
+  <arg name="field_y_min" default="-7.5" />
+  <arg name="field_y_max" default="7.5" />
+
+  <!-- One leg per tree row. Coverage alone would allow much wider legs - the
+       camera swath at 5.5 m is 9.2 m, so these legs overlap by 67% - and would
+       finish in fewer passes. Flying the rows instead buys every apple a view
+       from near directly overhead, where every error in the projection costs
+       least: an error scales with the offset from image centre, so it is worth
+       nothing under the aircraft and most at the frame edge. -->
+  <arg name="leg_spacing" default="3.0" />
+
+  <!-- 5.5 m gives about 9 mm per pixel, so a 0.11 m apple is ~12 px across.
+       Lower and the swath narrows without the detection getting meaningfully
+       better; higher and the apple starts to compete with the mask's speckle
+       floor. -->
+  <arg name="survey_altitude" default="5.5" />
+
+  <!-- Slow, and the camera is why rather than the airframe. At 10 Hz and
+       1.2 m/s the drone moves 0.12 m between frames, so each apple lands in
+       dozens of images and orchard_map's min_sightings threshold can be set
+       high enough to reject noise outright. At 4 m/s the same apple gets one
+       frame, and the threshold has to come down to where speckle survives. -->
+  <arg name="survey_speed" default="1.2" />
+
+  <!-- Ripe is red. The farm is built so this is a real discrimination: unripe
+       fruit is yellow-green and the foliage is green, so hue separates what is
+       being looked for from everything else in the scene.
+
+       Saturation is the guard that carries the weight, and 160 is chosen from
+       measurement rather than taste: a ripe apple sits at 241, while bark and
+       soil sit at 137 - and those two are only four hue units off the red
+       threshold, so relying on hue alone to reject them meant every shadow
+       that nudged a pixel across the line became a false apple. A floor at
+       160 sits in the gap and does not care what the lighting does. -->
+  <arg name="sat_min"     default="160" />
+  <arg name="val_min"     default="60" />
+  <arg name="min_area_px" default="30" />
+
+  <!-- The plane pixels are cast onto, and the mean apple height that
+       make_orchard prints when it generates the farm. Apples actually hang
+       from 1.45 m to 2.46 m, so this is wrong by up to half a metre for any
+       individual apple - a real error term rather than a hidden one. It scales
+       the offset from image centre, so it is worth nothing directly under the
+       aircraft. Flying along the rows is what keeps fruit near the centre. -->
+  <arg name="fruit_plane_z" default="1.99" />
+
+  <!-- Measuring the range from the apple's apparent size instead is textbook
+       monocular ranging and removes the flat-plane error entirely - and it was
+       measured, on this orchard, to make everything worse:
+
+                        on        off
+         recall        86.2%     94.7%
+         precision     62.8%     92.7%
+         position err  0.077 m   0.056 m
+
+       An apple is only ~12 px across at 5.5 m, so blob area is dominated by
+       noise, and a noisy range throws each sighting somewhere different, which
+       splits one apple into several map entries. It lost on position error
+       too, which is the metric it was meant to win. Left here as a switch: at
+       a lower altitude or with a longer lens it should start to pay. -->
+  <arg name="range_from_size" default="false" />
+
+  <!-- Believing an apple. A real one earns 58 sightings on average and 24 at
+       worst, so a floor of 15 clears the hardest real apple comfortably while
+       still rejecting a red pixel that flickered once. It was 6, which let
+       weak duplicate clusters through. -->
+  <arg name="min_sightings" default="15" />
+
+  <!-- The merge radius has to sit between two scales: the scatter of repeat
+       sightings of one apple, and the distance between two different apples.
+       The farm guarantees the second - the closest two ripe apples in this
+       seed are 0.31 m apart - so this is a choice with a floor rather than a guess.
+       Note what caps it: each report carries a few cm of position error, so two
+       real apples 0.31 m apart can be reported closer than that, which is why
+       the radius cannot be pushed up to the farm's true spacing without
+       starting to fuse genuine neighbours. -->
+  <arg name="merge_radius" default="0.28" />
+
+  <!-- Scoring. Read only by orchard_map, only after the survey finishes.
+       Nothing that flies or detects ever opens this file - it exists so the run
+       can be marked, not so the robot can cheat. Set empty to fly unscored. -->
+  <arg name="truth_file"
+       default="$(find uav_farm_survey)/config/orchard_truth.yaml" />
+  <arg name="report_file" default="$(env HOME)/ripe_fruit_report.csv" />
+
+  <group ns="$(arg ns)">
+
+    <include file="$(find hector_quadrotor_gazebo)/launch/spawn_quadrotor.launch">
+      <arg name="name"      value="$(arg ns)" />
+      <arg name="tf_prefix" value="$(arg ns)" />
+      <arg name="model"     value="$(find uav_farm_survey)/urdf/quadrotor_survey_cam.gazebo.xacro" />
+      <arg name="x"         value="$(arg spawn_x)" />
+      <arg name="y"         value="$(arg spawn_y)" />
+      <arg name="z"         value="$(arg spawn_z)" />
+    </include>
+
+    <!-- Off, as in every package here. auto_engage cuts the motors when it
+         sees a commanded descent it cannot achieve, which is landing
+         detection, and the end of a survey is exactly that. -->
+    <param name="controller/twist/auto_engage" value="false" type="bool" />
+
+    <node pkg="uav_farm_survey" type="survey_pilot" name="survey_pilot"
+          output="screen"
+          launch-prefix="bash -c 'sleep $(arg node_delay) &amp;&amp; exec &quot;$0&quot; &quot;$@&quot;' --">
+      <param name="field_x_min"     value="$(arg field_x_min)" />
+      <param name="field_x_max"     value="$(arg field_x_max)" />
+      <param name="field_y_min"     value="$(arg field_y_min)" />
+      <param name="field_y_max"     value="$(arg field_y_max)" />
+      <param name="leg_spacing"     value="$(arg leg_spacing)" />
+      <param name="survey_altitude" value="$(arg survey_altitude)" />
+      <param name="survey_speed"    value="$(arg survey_speed)" />
+      <param name="turn_speed"      value="0.8" />
+      <param name="arrive_radius"   value="0.35" />
+      <param name="angular_gain"    value="2.0" />
+      <param name="max_angular"     value="1.2" />
+      <param name="angle_tol"       value="0.10" />
+      <param name="vertical_speed"  value="0.8" />
+      <param name="hfov_deg"        value="80.0" />
+      <param name="return_home"     value="true" />
+      <param name="control_hz"      value="20.0" />
+      <param name="status_hz"       value="0.5" />
+    </node>
+
+    <node pkg="uav_farm_survey" type="fruit_detector" name="fruit_detector"
+          output="screen"
+          launch-prefix="bash -c 'sleep $(arg node_delay) &amp;&amp; exec &quot;$0&quot; &quot;$@&quot;' --">
+      <!-- hector's camera macro passes the sensor name to the Gazebo plugin as
+           <cameraName>, and the plugin puts that in front of every topic it
+           publishes - so the images come out on survey_cam/image_raw, not
+           image_raw. The node keeps the generic names and the launch does the
+           joining, which is the right way round: nothing in fruit_detector
+           should know what the camera is called.
+
+           Worth knowing how this fails, because it is silent. rostopic list
+           still shows /uav_0/image_raw, since the detector's own subscription
+           creates the entry - it just has no publisher. The node sits there
+           having never received a frame and says nothing, because it has
+           nothing to say. -->
+      <remap from="image_raw"   to="survey_cam/image_raw" />
+      <remap from="camera_info" to="survey_cam/camera_info" />
+      <param name="hue_lo_max"      value="10" />
+      <param name="hue_hi_min"      value="170" />
+      <param name="sat_min"         value="$(arg sat_min)" />
+      <param name="val_min"         value="$(arg val_min)" />
+      <param name="min_area_px"     value="$(arg min_area_px)" />
+      <param name="max_area_px"     value="4000" />
+      <param name="fruit_plane_z"   value="$(arg fruit_plane_z)" />
+      <param name="range_from_size" value="$(arg range_from_size)" />
+      <param name="fruit_diameter"  value="0.11" />
+      <param name="min_circularity" value="0.72" />
+      <param name="range_tol"       value="0.45" />
+      <param name="camera_offset_z" value="0.06" />
+      <param name="min_range"       value="0.8" />
+      <param name="edge_margin_px"  value="8" />
+      <param name="publish_debug"   value="true" />
+    </node>
+  </group>
+
+  <node pkg="uav_farm_survey" type="orchard_map" name="orchard_map"
+        output="screen"
+        launch-prefix="bash -c 'sleep $(arg node_delay) &amp;&amp; exec &quot;$0&quot; &quot;$@&quot;' --">
+    <param name="merge_radius"  value="$(arg merge_radius)" />
+    <param name="min_sightings" value="$(arg min_sightings)" />
+    <!-- Tight, and it has to be. At 0.40 this was looser than the distance
+         between two apples, so a report could be credited to a fruit it was
+         not looking at - which did not change the found/missed counts but
+         inflated the "landed on an unripe fruit" figure from 2 to 6, and that
+         figure is the one that would tell you the colour test was wrong. The
+         worst matched position error measured is 0.141 m, and it is under half
+         the 0.31 m fruit spacing, so the attribution means something. -->
+    <param name="match_radius"  value="0.15" />
+    <param name="truth_file"    value="$(arg truth_file)" />
+    <param name="report_file"   value="$(arg report_file)" />
+    <param name="publish_hz"    value="1.0" />
+  </node>
+
+</launch>

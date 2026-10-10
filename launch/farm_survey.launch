@@ -1,0 +1,137 @@
+<?xml version="1.0"?>
+<!--
+  farm_survey.launch
+  ==================
+  The whole survey in one command. One hector quadrotor covers an apple orchard
+  line by line, finds the ripe fruit with a downward camera, and reports where
+  each one is.
+
+    source ~/uav_ws/src/uav_pick_place/setup_uav.bash
+    roslaunch uav_farm_survey farm_survey.launch
+    roslaunch uav_farm_survey farm_survey.launch gui:=false
+    roslaunch uav_farm_survey farm_survey.launch rviz:=true
+
+  This file is nothing but the four staged launches run together, and every
+  argument it takes is passed straight through to one of them:
+
+    orchard_world.launch   Gazebo + the generated orchard
+    survey_robot.launch    the airframe, survey_pilot, fruit_detector, orchard_map
+    farm_rviz.launch       the map and the coverage pattern       (rviz:=true)
+    farm_rqt.launch        what the camera sees, annotated  (camera_view:=true)
+
+  Run them separately when working on one piece - the world is the slowest part
+  to load and the part you least often want to restart:
+
+    roslaunch uav_farm_survey orchard_world.launch     # leave this up
+    roslaunch uav_farm_survey survey_robot.launch      # kill and rerun freely
+    roslaunch uav_farm_survey farm_rviz.launch
+    roslaunch uav_farm_survey farm_rqt.launch
+
+  A different farm (the flags are written without their leading dashes here
+  only because XML comments may not contain a double dash):
+    rosrun uav_farm_survey make_orchard  seed 7
+    rosrun uav_farm_survey make_orchard  rows 8  trees 20
+  which rewrites both the world and the ground truth from one loop, so they
+  cannot disagree. Changing the size moves the whole farm - fence, yard, hives
+  and spawn included - and the generator prints the field and spawn arguments
+  that match what it wrote. Those are the defaults below; a resized world needs
+  them updated or the survey covers only part of the orchard.
+
+  Topics:
+    /farm/sightings          every red blob, projected, one per frame
+    /farm/map                merged fruit, growing during the flight
+    /farm/markers            RViz: found fruit, colour by position spread
+    /farm/progress           which leg, how much of the field is swept
+    /farm/survey_path        the planned pattern, latched
+    /uav_0/survey_cam/image_raw   the survey camera
+    /uav_0/detections/image  the same view, annotated
+-->
+<launch>
+
+  <!-- ============================ what to show ============================ -->
+  <arg name="gui"         default="true" />
+  <arg name="headless"    default="false" />
+  <arg name="rviz"        default="false" />
+  <arg name="camera_view" default="true" doc="pop up a window showing what the camera sees" />
+  <arg name="rviz_config" default="$(find uav_farm_survey)/rviz/farm.rviz" />
+  <arg name="world" default="$(find uav_farm_survey)/worlds/orchard.world" />
+  <arg name="ns"    default="uav_0" />
+
+  <!-- ============================== tuning =============================== -->
+  <!-- Each of these is documented where it is consumed, in
+       survey_robot.launch. They are repeated here only so that the one-command
+       form takes the same arguments the staged form does. -->
+  <arg name="field_x_min" default="-17.6" />
+  <arg name="field_x_max" default="17.6" />
+  <arg name="field_y_min" default="-7.5" />
+  <arg name="field_y_max" default="7.5" />
+  <arg name="leg_spacing"     default="3.0" />
+  <arg name="survey_altitude" default="5.5" />
+  <arg name="survey_speed"    default="1.2" />
+  <arg name="sat_min"     default="160" />
+  <arg name="val_min"     default="60" />
+  <arg name="min_area_px" default="30" />
+  <arg name="fruit_plane_z"   default="1.99" />
+  <arg name="range_from_size" default="false" doc="measure range from apple size instead of assuming the plane; measured worse here, apples are only ~12 px across" />
+  <arg name="min_sightings" default="15" />
+  <arg name="merge_radius"  default="0.28" />
+  <arg name="truth_file"
+       default="$(find uav_farm_survey)/config/orchard_truth.yaml" />
+  <arg name="report_file" default="$(env HOME)/ripe_fruit_report.csv" />
+
+  <!-- 20 rather than survey_robot's standalone 8: here the same clock also has
+       to cover Gazebo loading the world before the spawn can even begin, and
+       that is 96 trees of stacked primitives now rather than 40. Too short and
+       the pilot starts publishing cmd_vel into controllers that do not exist
+       yet, which is silent - the run simply begins with the aircraft sitting
+       on the ground. -->
+  <arg name="node_delay" default="20" />
+
+  <!-- =============================== 1. world ============================= -->
+  <include file="$(find uav_farm_survey)/launch/orchard_world.launch">
+    <arg name="gui"      value="$(arg gui)" />
+    <arg name="headless" value="$(arg headless)" />
+    <arg name="world"    value="$(arg world)" />
+  </include>
+
+  <!-- =============================== 2. robot ============================= -->
+  <include file="$(find uav_farm_survey)/launch/survey_robot.launch">
+    <arg name="ns"         value="$(arg ns)" />
+    <arg name="node_delay" value="$(arg node_delay)" />
+    <arg name="field_x_min" value="$(arg field_x_min)" />
+    <arg name="field_x_max" value="$(arg field_x_max)" />
+    <arg name="field_y_min" value="$(arg field_y_min)" />
+    <arg name="field_y_max" value="$(arg field_y_max)" />
+    <arg name="leg_spacing"     value="$(arg leg_spacing)" />
+    <arg name="survey_altitude" value="$(arg survey_altitude)" />
+    <arg name="survey_speed"    value="$(arg survey_speed)" />
+    <arg name="sat_min"     value="$(arg sat_min)" />
+    <arg name="val_min"     value="$(arg val_min)" />
+    <arg name="min_area_px" value="$(arg min_area_px)" />
+    <arg name="fruit_plane_z"   value="$(arg fruit_plane_z)" />
+    <arg name="range_from_size" value="$(arg range_from_size)" />
+    <arg name="min_sightings" value="$(arg min_sightings)" />
+    <arg name="merge_radius"  value="$(arg merge_radius)" />
+    <arg name="truth_file"    value="$(arg truth_file)" />
+    <arg name="report_file"   value="$(arg report_file)" />
+  </include>
+
+  <!-- =============================== 3. rviz ============================== -->
+  <include if="$(arg rviz)" file="$(find uav_farm_survey)/launch/farm_rviz.launch">
+    <arg name="rviz_config" value="$(arg rviz_config)" />
+    <arg name="delay"       value="$(arg node_delay)" />
+  </include>
+
+  <!-- ================================ 4. rqt ============================== -->
+  <!-- Later than the rest: rqt_image_view resolves the topic it is given at
+       startup, and the detector has to exist by then. Derived from node_delay
+       rather than fixed, because it was fixed at 16 against a node_delay of 12
+       and a bigger world pushed node_delay past it - at which point rqt was
+       resolving the topic before the detector that publishes it existed, and
+       came up on a dead topic showing nothing. -->
+  <include if="$(arg camera_view)" file="$(find uav_farm_survey)/launch/farm_rqt.launch">
+    <arg name="ns"    value="$(arg ns)" />
+    <arg name="delay" value="$(eval arg('node_delay') + 4)" />
+  </include>
+
+</launch>

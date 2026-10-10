@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""
+fruit_detector - finds ripe fruit in the survey camera and says where it is.
+
+Two jobs, and the second is the one that is easy to get subtly wrong.
+
+1. Decide which pixels are ripe fruit.
+2. Turn those pixels into a position on the farm.
+
+What "ripe" means to this node
+------------------------------
+Red, in HSV, and not much else. Hue near 0 (which wraps, so the test is two
+bands), high saturation, decent value. The farm is built so that this is a real
+discrimination rather than a trick: the unripe fruit is green and so is the
+foliage, so a detector that merely found "objects" would report three times too
+many. Hue separates them cleanly, which is exactly why colour spaces that put
+hue on its own axis exist.
+
+Saturation is the guard that matters most. Shadowed foliage and the grey ground
+both drift towards low-saturation reds under some lighting, and a hue-only test
+picks them up as a scatter of small blobs across the whole image. ~sat_min
+throws those out; the fruit is a strongly saturated red and survives it.
+
+Blobs, not pixels
+-----------------
+Contours, filtered by area. ~min_area_px rejects speckle - single red pixels
+from compression or a lit edge - and ~max_area_px rejects anything too big to
+be a berry, which in practice means two fruit touching in the image, or a
+reflection. Both bounds are in pixels rather than metres because the thing
+being filtered is an image artefact; the conversion to metres happens after.
+
+From pixel to farm
+------------------
+This is the part with the sign errors in it, so the derivation is written out.
+
+The camera looks straight down, mounted with rpy (0, pi/2, 0) - see
+urdf/quadrotor_survey_cam.gazebo.xacro, which derives the same chain. In the
+optical frame that mounting gives:
+
+    image right (+u)  ->  body -y
+    image down  (+v)  ->  body -x
+
+A blob at pixel (u, v), with the camera's principal point (cx, cy) and focal
+lengths (fx, fy) from camera_info, sits at
+
+    dx_img = (u - cx) / fx        # tangent of the angle off-axis, image right
+    dy_img = (v - cy) / fy        #                                image down
+
+and at a range d along the optical axis those tangents become metres:
+
+    body_x = -dy_img * d
+    body_y = -dx_img * d
+
+then rotate by the aircraft's yaw into the world and add its position.
+
+Getting the range right
+-----------------------
+d is the camera's height above the apple, and there are two ways to get it.
+
+The cheap one is a flat-plane assumption: the drone's altitude, less the
+camera's mount offset, less ~fruit_plane_z. That is what this node used to do,
+and on a field of uniform bushes it was fine. On apple trees it is not: fruit
+hangs anywhere from 1.45 m to 2.46 m, so the assumed height is wrong by up to
+half a metre. An error of e metres scales the offset from image centre by e/d,
+so an apple 2 m off-axis at d = 3.4 m moves 0.29 m - which is more than the
+gap between two apples on a tree, and enough to make a map worse than useless.
+
+The better one is to measure it, and a monocular camera can, because the size
+of the thing being looked at is known. An apple is ~0.11 m across, so
+
+    d = fx * apple_diameter / apparent_diameter_px
+
+with the apparent diameter taken from the blob's area as 2*sqrt(A/pi). This is
+ordinary size-based ranging and it removes the flat-plane error entirely for
+any apple whose blob is clean.
+
+Which is the catch, so the two are used together. A partly occluded apple, or
+two overlapping in the image, gives an area that is not the area of one whole
+apple, and the range comes out wrong in a way nothing downstream could detect.
+So the size estimate is used only when the blob is round enough to be one whole
+apple (~circularity), and is clamped to a sensible band around the flat-plane
+figure. Anything failing those falls back to the plane.
+
+That is also still why ~leg_spacing defaults to the row spacing rather than the
+wider coverage-optimal figure: whatever the range estimate, an apple near the
+middle of the frame is less sensitive to every error in this chain.
+
+Nothing here reads the ground truth. The detector gets an image, a camera
+model, and the aircraft's pose.
+
+Subscriptions
+-------------
+  image_raw             sensor_msgs/Image
+  camera_info           sensor_msgs/CameraInfo
+  ground_truth/state    nav_msgs/Odometry
+
+Publications
+------------
+  /farm/sightings       uav_farm_survey/FruitSighting   one per blob per frame
+  detections/image      sensor_msgs/Image               the annotated view
+
+ROS Parameters (private, ~)
+---------------------------
+  ~hue_lo_max      int    Red wraps, so hue passes below this  (default 10)
+  ~hue_hi_min      int    ...or above this                     (default 170)
+  ~sat_min         int    Saturation floor; the main guard     (default 120)
+  ~val_min         int    Value floor, against dark red shadow (default 60)
+  ~min_area_px     float  Smallest blob worth believing        (default 30)
+  ~max_area_px     float  Largest; above this it is two fruit  (default 4000)
+  ~fruit_plane_z   float  Mean height fruit sits at, m; the
+                          fallback when size ranging is not
+                          usable                               (default 1.99)
+  ~range_from_size bool   Estimate range from apparent apple
+                          size rather than assuming the plane.
+                          Measured worse on this orchard: an
+                          apple is ~12 px across, so blob area
+                          is noisy and every sighting lands in
+                          a different place, splitting clusters
+                          (precision 62.8% on, 92.7% off)      (default false)
+  ~fruit_diameter  float  How big an apple is, m               (default 0.11)
+  ~min_circularity float  Blobs rounder than this are treated
+                          as one whole apple and get size
+                          ranging; others fall back            (default 0.72)
+  ~range_tol       float  Size range must stay within this
+                          fraction of the plane estimate       (default 0.45)
+  ~camera_offset_z float  Camera below base_link, m            (default 0.06)
+  ~min_range       float  Ignore frames closer than this, m    (default 0.8)
+  ~edge_margin_px  int    Ignore blobs this close to the frame
+                          edge - a fruit half out of shot has
+                          a centroid that is not its centre    (default 8)
+  ~publish_debug   bool   Publish the annotated image          (default true)
+"""
+
+import math
+
+import cv2
+import numpy as np
+import rospy
+from cv_bridge import CvBridge
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Image, CameraInfo
+from tf.transformations import euler_from_quaternion
+
+from uav_farm_survey.msg import FruitSighting
+
+
+class FruitDetector(object):
+
+    def __init__(self):
+        rospy.init_node('fruit_detector', anonymous=False)
+        self._ns = rospy.get_namespace().strip('/') or 'uav'
+
+        self._hue_lo = int(rospy.get_param('~hue_lo_max', 10))
+        self._hue_hi = int(rospy.get_param('~hue_hi_min', 170))
+        self._sat_min = int(rospy.get_param('~sat_min', 120))
+        self._val_min = int(rospy.get_param('~val_min', 60))
+        self._min_area = rospy.get_param('~min_area_px', 30.0)
+        self._max_area = rospy.get_param('~max_area_px', 4000.0)
+        self._plane_z = rospy.get_param('~fruit_plane_z', 1.99)
+        self._size_range = rospy.get_param('~range_from_size', False)
+        self._fruit_d = rospy.get_param('~fruit_diameter', 0.11)
+        self._min_circ = rospy.get_param('~min_circularity', 0.72)
+        self._range_tol = rospy.get_param('~range_tol', 0.45)
+        self._cam_dz = rospy.get_param('~camera_offset_z', 0.06)
+        self._min_range = rospy.get_param('~min_range', 0.8)
+        self._edge = int(rospy.get_param('~edge_margin_px', 8))
+        self._debug = rospy.get_param('~publish_debug', True)
+
+        self._bridge = CvBridge()
+        self._K = None
+        self._pose = None            # (x, y, z, yaw)
+        self._frames = 0
+        self._blobs = 0
+
+        rospy.Subscriber('camera_info', CameraInfo, self._info_cb)
+        rospy.Subscriber('ground_truth/state', Odometry, self._odom_cb)
+        rospy.Subscriber('image_raw', Image, self._image_cb, queue_size=1,
+                         buff_size=2 ** 24)
+
+        self._pub = rospy.Publisher('/farm/sightings', FruitSighting,
+                                    queue_size=50)
+        self._dbg = (rospy.Publisher('detections/image', Image, queue_size=1)
+                     if self._debug else None)
+
+        rospy.Timer(rospy.Duration(5.0), self._report)
+        rospy.loginfo('[%s] fruit detector up: ripe = hue<%d or >%d, sat>%d, '
+                      'area %d-%d px', self._ns, self._hue_lo, self._hue_hi,
+                      self._sat_min, int(self._min_area), int(self._max_area))
+
+    # ----------------------------------------------------------- callbacks --
+    def _info_cb(self, msg):
+        # fx, fy, cx, cy. Taken from camera_info rather than recomputed from
+        # the FOV and resolution, so that changing the lens in the xacro does
+        # not silently leave this node projecting with the old numbers.
+        self._K = (msg.K[0], msg.K[4], msg.K[2], msg.K[5])
+
+    def _odom_cb(self, msg):
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        self._pose = (p.x, p.y, p.z, yaw)
+
+    def _report(self, _e):
+        if self._frames:
+            rospy.loginfo('[%s] %d frames, %d sightings (%.1f per frame)',
+                          self._ns, self._frames, self._blobs,
+                          float(self._blobs) / self._frames)
+
+    # ------------------------------------------------------------ geometry --
+    def _project(self, u, v, d):
+        """Pixel -> world, on the assumed fruit plane. See the header.
+
+        Returns None if the aircraft's pose or the camera model is not known
+        yet, which happens for the first frame or two and is not worth a
+        warning.
+        """
+        if self._K is None or self._pose is None:
+            return None
+        fx, fy, cx, cy = self._K
+        px, py, _, yaw = self._pose
+
+        dx_img = (u - cx) / fx          # image right
+        dy_img = (v - cy) / fy          # image down
+
+        body_x = -dy_img * d            # image down  -> body -x
+        body_y = -dx_img * d            # image right -> body -y
+
+        c, s = math.cos(yaw), math.sin(yaw)
+        return (px + body_x * c - body_y * s,
+                py + body_x * s + body_y * c)
+
+    # --------------------------------------------------------- the detector --
+    def _image_cb(self, msg):
+        if self._pose is None or self._K is None:
+            return
+        d = self._pose[2] - self._cam_dz - self._plane_z
+        if d < self._min_range:
+            # Too low for the flat-plane projection to mean anything, and on
+            # the ground it would report the landing gear.
+            return
+
+        try:
+            bgr = self._bridge.imgmsg_to_cv2(msg, 'bgr8')
+        except Exception as exc:
+            rospy.logwarn_throttle(5.0, '[%s] cv_bridge: %s', self._ns, exc)
+            return
+
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        # Red straddles the hue wrap-around, so it takes two bands. Everything
+        # else in this farm - foliage, unripe fruit - is green, which is nowhere
+        # near either of them.
+        lo = cv2.inRange(hsv, (0, self._sat_min, self._val_min),
+                              (self._hue_lo, 255, 255))
+        hi = cv2.inRange(hsv, (self._hue_hi, self._sat_min, self._val_min),
+                              (179, 255, 255))
+        mask = cv2.bitwise_or(lo, hi)
+        # Close small holes then drop speckle. Opening after closing, because
+        # a berry with a specular highlight through the middle is one fruit,
+        # not two, and joining it back up before measuring area is what keeps
+        # it that way.
+        k = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        h, w = mask.shape[:2]
+        found = 0
+        vis = None
+        if self._dbg:
+            # Tint everything the colour test accepted, so the debug view shows
+            # what the detector is *thinking* and not only what it concluded.
+            # A blob that is rejected on area or roundness still glows here,
+            # which is the difference between "the threshold is wrong" and
+            # "the filters are too tight" when a run goes badly.
+            vis = bgr.copy()
+            tint = np.zeros_like(vis)
+            tint[:, :, 1] = mask
+            tint[:, :, 2] = mask
+            vis = cv2.addWeighted(vis, 1.0, tint, 0.35, 0)
+
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < self._min_area or area > self._max_area:
+                continue
+            m = cv2.moments(c)
+            if m['m00'] <= 0.0:
+                continue
+            u = m['m10'] / m['m00']
+            v = m['m01'] / m['m00']
+            if (u < self._edge or v < self._edge or
+                    u > w - self._edge or v > h - self._edge):
+                # Half out of frame: the centroid of what is visible is not the
+                # centroid of the fruit, so the position would be biased inward
+                # by an amount nothing downstream could detect. It will be seen
+                # properly in the next frame or the next leg.
+                continue
+
+            # Range: measured from the blob if it looks like one whole apple,
+            # assumed from the plane otherwise. See the header.
+            d_use = d
+            if self._size_range:
+                per = cv2.arcLength(c, True)
+                circ = (4.0 * math.pi * area / (per * per)) if per > 0 else 0.0
+                if circ >= self._min_circ:
+                    dia_px = 2.0 * math.sqrt(area / math.pi)
+                    if dia_px > 1.0:
+                        d_size = self._K[0] * self._fruit_d / dia_px
+                        lo = d * (1.0 - self._range_tol)
+                        hi = d * (1.0 + self._range_tol)
+                        if lo <= d_size <= hi:
+                            d_use = d_size
+
+            world = self._project(u, v, d_use)
+            if world is None:
+                continue
+
+            s = FruitSighting()
+            s.header.stamp = msg.header.stamp
+            s.header.frame_id = 'world'
+            s.x, s.y = world[0], world[1]
+            # The height this sighting implies, which is the aircraft's
+            # altitude less the range actually used - so a size-ranged apple
+            # reports where it really hangs rather than where the plane says.
+            s.z = self._pose[2] - self._cam_dz - d_use
+            s.u, s.v = int(u), int(v)
+            s.area_px = float(area)
+            s.range = d_use
+            self._pub.publish(s)
+            found += 1
+
+            if vis is not None:
+                # Ring the accepted apple, and label it with where the survey
+                # thinks it is and how far away it decided it was. Green ring
+                # when the range was measured from the blob, amber when it fell
+                # back to the assumed plane - so a frame where the size ranging
+                # is failing is obvious at a glance.
+                col = (0, 255, 80) if d_use != d else (0, 190, 255)
+                cv2.circle(vis, (int(u), int(v)), 13, col, 2)
+                cv2.putText(vis, '%.1f,%.1f' % world, (int(u) + 15, int(v) - 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, col, 1)
+                cv2.putText(vis, '%.2fm' % d_use, (int(u) + 15, int(v) + 12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.34, col, 1)
+
+        self._frames += 1
+        self._blobs += found
+
+        if vis is not None:
+            cv2.rectangle(vis, (0, 0), (w, 46), (0, 0, 0), -1)
+            cv2.putText(vis, 'RIPE IN FRAME: %d' % found, (8, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 255, 80), 2)
+            cv2.putText(vis, 'alt %.2f m over plane | total %d in %d frames'
+                        % (d, self._blobs + found, self._frames + 1),
+                        (8, 39), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1)
+            # Crosshair: the one pixel where the projection has no lever arm at
+            # all, so it is worth being able to see what is under it.
+            cv2.drawMarker(vis, (w // 2, h // 2), (255, 255, 255),
+                           cv2.MARKER_CROSS, 18, 1)
+            try:
+                # Built by hand rather than with cv_bridge.cv2_to_imgmsg,
+                # which raises KeyError: 16 on this install - a cv_bridge /
+                # OpenCV version mismatch in its cvtype_to_name table that
+                # hits every bgr8 image, not just some. imgmsg_to_cv2 on the
+                # way in is unaffected, so only the outbound leg needs this.
+                # A bgr8 Image is a header, a shape and the bytes; there is
+                # nothing cv_bridge does here that is worth the dependency.
+                out = Image()
+                out.header = msg.header
+                out.height, out.width = vis.shape[:2]
+                out.encoding = 'bgr8'
+                out.is_bigendian = 0
+                out.step = out.width * 3
+                out.data = vis.tobytes()
+                self._dbg.publish(out)
+            except Exception as exc:
+                # Never swallow this silently. A debug view that fails quietly
+                # looks exactly like a debug view showing nothing interesting,
+                # and the difference costs a whole run to notice.
+                rospy.logwarn_throttle(5.0, '[%s] debug view: %s',
+                                       self._ns, exc)
+
+
+def main():
+    FruitDetector()
+    rospy.spin()
+
+
+if __name__ == '__main__':
+    main()

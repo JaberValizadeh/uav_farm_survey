@@ -1,0 +1,50 @@
+<?xml version="1.0"?>
+<!--
+  orchard_world.launch
+  ====================
+  Step 1 of 4: the farm, and nothing else.
+
+  Gazebo with worlds/orchard.world - 6 rows, 96 apple trees, 478 apples, of
+  which 231 are ripe. No robot, no detector, no map. This also brings up the
+  roscore that the other three steps attach to, so it is the one that has to
+  start first.
+
+    roslaunch uav_farm_survey orchard_world.launch
+
+  Leave it running. The world takes the longest to load and is the part you
+  least often want to restart - staging the launch this way means the robot,
+  RViz and rqt can each be killed and restarted against a world that never
+  moves, which is the whole reason to split it up.
+
+  A different farm (note: the flags are written without their leading dashes
+  here only because XML comments may not contain a double dash):
+    rosrun uav_farm_survey make_orchard  seed 7  rows 5  trees 12
+  which rewrites both worlds/orchard.world and config/orchard_truth.yaml from
+  one pass of one loop, so the world and the answer key cannot disagree.
+  Restart this launch afterwards to pick the new world up.
+-->
+<launch>
+
+  <arg name="gui"      default="true"  doc="Gazebo's own window" />
+  <arg name="headless" default="false" />
+  <arg name="paused"   default="false" />
+  <arg name="world"    default="$(find uav_farm_survey)/worlds/orchard.world" />
+
+  <!-- The world's materials live in models/orchard inside this package, and
+       Gazebo has to be told where to find them before gzserver starts. Without
+       this every textured surface - grass, bark, foliage, the shed - renders
+       flat white, which is obvious in the Gazebo window and, less obviously,
+       changes what the fruit detector is looking at. -->
+  <env name="GAZEBO_MODEL_PATH"
+       value="$(find uav_farm_survey)/models:$(optenv GAZEBO_MODEL_PATH)" />
+
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name"   value="$(arg world)" />
+    <arg name="gui"          value="$(arg gui)" />
+    <arg name="headless"     value="$(arg headless)" />
+    <arg name="paused"       value="$(arg paused)" />
+    <arg name="use_sim_time" value="true" />
+    <arg name="debug"        value="false" />
+  </include>
+
+</launch>

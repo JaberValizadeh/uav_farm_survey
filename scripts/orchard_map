@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""
+orchard_map - turns a stream of sightings into a list of fruit, and reports it.
+
+The detector sees the same berry in twenty or thirty consecutive frames as the
+aircraft passes over it, and again on the next leg if the legs overlap. Each of
+those is a slightly different world position, because the projection is
+imperfect and the aircraft is moving. This node is what decides that they are
+all one fruit.
+
+Merging
+-------
+Two steps, and the second one exists because the first is not enough on its
+own. A sighting joins the nearest existing cluster within ~merge_radius, and a
+fruit's position is the running mean of everything in it - but that rule never
+asks whether two *clusters* have become the same thing, and they do. See
+_consolidate().
+
+Nearest-neighbour within ~merge_radius, and the position of a fruit is the
+running mean of everything merged into it. That is about the simplest thing
+that works, and it works because of the number the merge radius is set from:
+fruit in this farm are placed on bushes 1.6 m apart with a canopy 0.84 m
+across, so two *different* fruit are rarely closer than about 0.15 m, while
+repeat sightings of one fruit land within a few centimetres of each other.
+~merge_radius sits between those two scales. Set it too large and two berries
+on the same bush become one; too small and one berry becomes a cloud.
+
+`spread` is kept per fruit - the largest distance any of its sightings fell
+from the running mean - because it is the honest confidence measure. A fruit
+seen thirty times from thirty poses with a spread of 3 cm is a real detection.
+The same count with a spread of 40 cm means the projection is disagreeing with
+itself, and the position should not be trusted even though the count looks
+reassuring.
+
+~min_sightings is the filter that actually matters for precision. A single
+frame with one red blob is noise; something seen in fifteen consecutive frames
+is a fruit. Because the drone flies at 1.2 m/s under a 10 Hz camera, a real
+fruit gets dozens of frames, so this threshold can be set high enough to remove
+essentially all false positives without costing recall.
+
+Scoring
+-------
+If ~truth_file is given, the map is scored against it when the survey finishes:
+every true ripe fruit is matched to the nearest report within ~match_radius,
+and what is left over on each side is a miss or a false positive. Unripe fruit
+is in the truth file too, and a report that lands on one is counted separately
+- that is the interesting failure for a fruit detector, and lumping it in with
+ordinary false positives would hide it.
+
+The truth file is only ever read here, and only after the fact. Nothing that
+flies or detects has access to it.
+
+Subscriptions
+-------------
+  /farm/sightings       uav_farm_survey/FruitSighting
+  /farm/progress        uav_farm_survey/SurveyProgress
+
+Publications
+------------
+  /farm/map             uav_farm_survey/FruitMap        (1 Hz)
+  /farm/markers         visualization_msgs/MarkerArray  RViz
+
+ROS Parameters (private, ~)
+---------------------------
+  ~merge_radius   float  Sightings within this are one fruit, m (default 0.30)
+  ~min_sightings  int    Frames before a blob counts as fruit   (default 6)
+  ~match_radius   float  Scoring: report matches truth within m (default 0.40)
+  ~truth_file     str    config/orchard_truth.yaml, or empty    (default '')
+  ~report_file    str    Where to write the CSV of found fruit  (default '')
+  ~publish_hz     float  Map and marker rate, Hz                (default 1.0)
+"""
+
+import math
+import os
+
+import rospy
+from std_msgs.msg import ColorRGBA
+from geometry_msgs.msg import Point
+from visualization_msgs.msg import Marker, MarkerArray
+
+from uav_farm_survey.msg import FruitSighting, FruitMap, RipeFruit, SurveyProgress
+
+_RESET, _BOLD = '\033[0m', '\033[1m'
+_GREEN, _RED, _YELLOW, _CYAN = '\033[92m', '\033[91m', '\033[93m', '\033[96m'
+
+
+class _Fruit(object):
+    """One believed fruit: a running mean, and how much its sightings vary."""
+
+    __slots__ = ('id', 'x', 'y', 'n', 'spread', 'first', 'last')
+
+    def __init__(self, fid, x, y, now):
+        self.id = fid
+        self.x, self.y = x, y
+        self.n = 1
+        self.spread = 0.0
+        self.first = self.last = now
+
+    def add(self, x, y, now):
+        self.n += 1
+        # Running mean rather than keeping every sighting: a survey of a real
+        # field is tens of thousands of sightings and none of them are wanted
+        # afterwards, only the estimate they support.
+        self.x += (x - self.x) / self.n
+        self.y += (y - self.y) / self.n
+        self.spread = max(self.spread, math.hypot(x - self.x, y - self.y))
+        self.last = now
+
+
+class OrchardMap(object):
+
+    def __init__(self):
+        rospy.init_node('orchard_map', anonymous=False)
+
+        self._merge = rospy.get_param('~merge_radius', 0.30)
+        self._min_n = int(rospy.get_param('~min_sightings', 6))
+        self._match = rospy.get_param('~match_radius', 0.40)
+        self._truth_file = rospy.get_param('~truth_file', '')
+        self._report_file = rospy.get_param('~report_file', '')
+        hz = rospy.get_param('~publish_hz', 1.0)
+
+        self._fruit = []
+        self._next_id = 0
+        self._raw = 0
+        self._state = ''
+        self._scored = False
+
+        rospy.Subscriber('/farm/sightings', FruitSighting, self._sighting_cb)
+        rospy.Subscriber('/farm/progress', SurveyProgress, self._progress_cb)
+        self._map_pub = rospy.Publisher('/farm/map', FruitMap, queue_size=2)
+        self._mk_pub = rospy.Publisher('/farm/markers', MarkerArray,
+                                       queue_size=2, latch=True)
+
+        rospy.Timer(rospy.Duration(1.0 / max(hz, 0.1)), self._publish)
+        rospy.on_shutdown(self._final)
+        rospy.loginfo('[MAP] merging within %.2f m, believing at %d sightings',
+                      self._merge, self._min_n)
+
+    # ----------------------------------------------------------- callbacks --
+    def _sighting_cb(self, s):
+        self._raw += 1
+        now = s.header.stamp
+        best, best_d = None, self._merge
+        for f in self._fruit:
+            d = math.hypot(s.x - f.x, s.y - f.y)
+            if d < best_d:
+                best, best_d = f, d
+        if best is None:
+            self._fruit.append(_Fruit(self._next_id, s.x, s.y, now))
+            self._next_id += 1
+        else:
+            best.add(s.x, s.y, now)
+
+    def _progress_cb(self, m):
+        was = self._state
+        self._state = m.state
+        if m.state == 'DONE' and was != 'DONE' and not self._scored:
+            self._scored = True
+            self._final()
+
+    # ------------------------------------------------------------- output --
+    def _consolidate(self):
+        """Merge clusters that have ended up on top of each other.
+
+        _sighting_cb only ever assigns a new sighting to the nearest existing
+        cluster; it never asks whether two clusters have become the same thing.
+        They do. The first sightings of a fruit arrive while it is at the edge
+        of the frame, where the projection is worst, so a berry can seed one
+        cluster on the way in and a second a few centimetres away once the
+        aircraft is overhead - and both then accumulate happily for the rest of
+        the pass.
+
+        Measured before this existed: 75 fruit reported against 60 real ones,
+        with 19 pairs closer together than the closest two *actual* fruit on
+        the farm (0.262 m). Every one of those pairs was a single berry counted
+        twice, and it showed up in the score as a precision of 80% - which read
+        like a colour problem and was not one.
+
+        Weighted by sighting count, because a cluster of ninety sightings and
+        one of seven are not equally good estimates of where the fruit is.
+
+        Restarting the sweep after each merge is deliberate: merging a pair
+        moves the survivor, which can bring it within range of a third cluster
+        that was not close to either. With a hundred-odd fruit at 1 Hz the cost
+        does not matter and the alternative is leaving the job half done.
+        """
+        merged = True
+        while merged:
+            merged = False
+            for i in range(len(self._fruit)):
+                for j in range(i + 1, len(self._fruit)):
+                    a, b = self._fruit[i], self._fruit[j]
+                    d = math.hypot(a.x - b.x, a.y - b.y)
+                    if d >= self._merge:
+                        continue
+                    n = a.n + b.n
+                    a.x = (a.x * a.n + b.x * b.n) / n
+                    a.y = (a.y * a.n + b.y * b.n) / n
+                    # The gap the two clusters were apart is itself evidence
+                    # about how much this fruit's sightings disagree, so it
+                    # belongs in the spread rather than being discarded.
+                    a.spread = max(a.spread, b.spread, d)
+                    a.n = n
+                    a.first = min(a.first, b.first)
+                    a.last = max(a.last, b.last)
+                    del self._fruit[j]
+                    merged = True
+                    break
+                if merged:
+                    break
+
+    def _believed(self):
+        return [f for f in self._fruit if f.n >= self._min_n]
+
+    def _publish(self, _e):
+        self._consolidate()
+        believed = self._believed()
+
+        m = FruitMap()
+        m.header.stamp = rospy.Time.now()
+        m.header.frame_id = 'world'
+        m.sightings_total = self._raw
+        for f in believed:
+            r = RipeFruit()
+            r.id, r.x, r.y = f.id, f.x, f.y
+            r.sightings, r.spread = f.n, f.spread
+            r.first_seen, r.last_seen = f.first, f.last
+            m.fruit.append(r)
+        self._map_pub.publish(m)
+
+        arr = MarkerArray()
+        now = rospy.Time.now()
+        for i, f in enumerate(believed):
+            mk = Marker()
+            mk.header.frame_id = 'world'
+            mk.header.stamp = now
+            mk.ns = 'ripe'
+            mk.id = i
+            mk.type = Marker.SPHERE
+            mk.action = Marker.ADD
+            mk.pose.position = Point(f.x, f.y, 0.66)
+            mk.pose.orientation.w = 1.0
+            mk.scale.x = mk.scale.y = mk.scale.z = 0.26
+            # Confidence as colour: a fruit whose sightings agree is solid red,
+            # one whose sightings scatter fades towards yellow. It is the
+            # spread that says whether a position is trustworthy, so it is the
+            # thing worth seeing at a glance.
+            bad = min(1.0, f.spread / 0.35)
+            mk.color = ColorRGBA(1.0, 0.15 + 0.7 * bad, 0.05, 0.9)
+            mk.lifetime = rospy.Duration(0)
+            arr.markers.append(mk)
+
+            txt = Marker()
+            txt.header.frame_id = 'world'
+            txt.header.stamp = now
+            txt.ns = 'ripe_label'
+            txt.id = i
+            txt.type = Marker.TEXT_VIEW_FACING
+            txt.action = Marker.ADD
+            txt.pose.position = Point(f.x, f.y, 1.05)
+            txt.pose.orientation.w = 1.0
+            txt.scale.z = 0.18
+            txt.color = ColorRGBA(1.0, 0.9, 0.5, 1.0)
+            txt.text = '%d' % f.n
+            txt.lifetime = rospy.Duration(0)
+            arr.markers.append(txt)
+        self._mk_pub.publish(arr)
+
+    # ------------------------------------------------------------ scoring --
+    def _load_truth(self):
+        if not self._truth_file or not os.path.exists(self._truth_file):
+            return None
+        try:
+            import yaml
+            with open(self._truth_file) as fh:
+                return yaml.safe_load(fh)
+        except Exception as exc:
+            rospy.logwarn('[MAP] could not read truth: %s', exc)
+            return None
+
+    def _final(self):
+        self._consolidate()
+        believed = self._believed()
+        print()
+        print(_BOLD + '  === survey report ' + '=' * 46 + _RESET, flush=True)
+        print('   sightings %d, merged into %d blobs, %d believed (>= %d frames)'
+              % (self._raw, len(self._fruit), len(believed), self._min_n),
+              flush=True)
+
+        if believed:
+            sp = sorted(f.spread for f in believed)
+            print('   position spread: median %.3f m, worst %.3f m'
+                  % (sp[len(sp) // 2], sp[-1]), flush=True)
+
+        if self._report_file:
+            try:
+                with open(self._report_file, 'w') as fh:
+                    fh.write('id,x,y,sightings,spread_m\n')
+                    for f in believed:
+                        fh.write('%d,%.4f,%.4f,%d,%.4f\n'
+                                 % (f.id, f.x, f.y, f.n, f.spread))
+                print('   written: %s' % self._report_file, flush=True)
+            except Exception as exc:
+                rospy.logwarn('[MAP] could not write report: %s', exc)
+
+        truth = self._load_truth()
+        if truth is None:
+            print('   (no ground truth given - not scored)', flush=True)
+            print(flush=True)
+            return
+
+        ripe = [(r[1], r[2]) for r in truth.get('ripe', [])]
+        unripe = [(r[1], r[2]) for r in truth.get('unripe', [])]
+
+        # Greedy nearest matching, closest pair first. Not optimal - a true
+        # assignment wants Hungarian - but with a match radius well under the
+        # spacing between fruit the two agree, and greedy cannot match one
+        # report to two fruit.
+        pairs = []
+        for i, (tx, ty) in enumerate(ripe):
+            for j, f in enumerate(believed):
+                d = math.hypot(tx - f.x, ty - f.y)
+                if d <= self._match:
+                    pairs.append((d, i, j))
+        pairs.sort()
+        used_t, used_r, errs = set(), set(), []
+        for d, i, j in pairs:
+            if i in used_t or j in used_r:
+                continue
+            used_t.add(i)
+            used_r.add(j)
+            errs.append(d)
+
+        tp = len(used_t)
+        fn = len(ripe) - tp
+        unmatched = [f for j, f in enumerate(believed) if j not in used_r]
+
+        # A report that landed on an unripe fruit is its own kind of wrong: the
+        # detector saw something real and called it ripe. Separating it from
+        # ordinary noise is the difference between "the colour test is off" and
+        # "there is speckle in the mask".
+        on_unripe = 0
+        for f in unmatched:
+            if any(math.hypot(ux - f.x, uy - f.y) <= self._match
+                   for ux, uy in unripe):
+                on_unripe += 1
+        fp = len(unmatched)
+
+        rec = 100.0 * tp / max(len(ripe), 1)
+        prec = 100.0 * tp / max(tp + fp, 1)
+        print(flush=True)
+        print(_BOLD + '   scored against %s' % os.path.basename(self._truth_file)
+              + _RESET, flush=True)
+        print('   ripe fruit on the farm : %d' % len(ripe), flush=True)
+        print('   found                  : %s%d%s   (recall %s%.1f%%%s)'
+              % (_GREEN, tp, _RESET, _GREEN, rec, _RESET), flush=True)
+        print('   missed                 : %s%d%s' % (_YELLOW, fn, _RESET),
+              flush=True)
+        print('   false positives        : %s%d%s   (precision %s%.1f%%%s)'
+              % (_RED if fp else _GREEN, fp, _RESET,
+                 _GREEN, prec, _RESET), flush=True)
+        if fp:
+            print('     of which on unripe fruit: %d' % on_unripe, flush=True)
+        if errs:
+            errs.sort()
+            print('   position error         : mean %s%.3f m%s, median %.3f m, '
+                  'worst %.3f m'
+                  % (_CYAN, sum(errs) / len(errs), _RESET,
+                     errs[len(errs) // 2], errs[-1]), flush=True)
+        print(flush=True)
+
+
+def main():
+    OrchardMap()
+    rospy.spin()
+
+
+if __name__ == '__main__':
+    main()
