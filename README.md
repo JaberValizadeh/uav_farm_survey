@@ -61,6 +61,41 @@ wherever it was left instead of from the corner of the field.
 
 ---
 
+## Requirements and install
+
+Ubuntu 20.04, **ROS Noetic** and Gazebo 11. hector_quadrotor and the packages around it are not released as Noetic debs, so the workspace is a source build:
+
+```bash
+mkdir -p ~/uav_ws/src && cd ~/uav_ws/src
+git clone https://github.com/ros-geographic-info/unique_identifier.git
+git clone https://github.com/ros-geographic-info/geographic_info.git
+git clone https://github.com/RAFALAMAO/hector-quadrotor-noetic.git
+git clone https://github.com/JaberValizadeh/uav_farm_survey.git
+
+cd ~/uav_ws
+rosdep install --from-paths src --ignore-src -r -y
+catkin_make --pkg uuid_msgs unique_id geographic_msgs geodesy
+catkin_make
+```
+
+The two-stage build is not optional. `hector_pose_estimation_core` includes `geographic_msgs` headers without declaring a dependency on the target that generates them, so a single parallel build races and fails on the first pass.
+
+### Environment
+
+The commands in this README source `~/uav_ws/src/uav_pick_place/setup_uav.bash` from the author's workspace. That package is not published; if you do not have it, this is the equivalent, in every terminal:
+
+```bash
+source /opt/ros/noetic/setup.bash
+source ~/uav_ws/devel/setup.bash
+
+# hector's Gazebo plugins
+export GAZEBO_PLUGIN_PATH=$HOME/uav_ws/devel/lib:${GAZEBO_PLUGIN_PATH:-}
+# the quadrotor meshes, for package:// URIs in the URDF
+export GAZEBO_MODEL_PATH=$HOME/uav_ws/src/hector-quadrotor-noetic:${GAZEBO_MODEL_PATH:-}
+```
+
+---
+
 ## What it does, and how well
 
 The orchard is **96 apple trees** in 6 rows of 16, carrying **478 apples** — 231
